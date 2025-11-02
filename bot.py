@@ -411,6 +411,7 @@ class AvailabilityDayView(discord.ui.View):
             poll_tmp = temp_selections.setdefault(poll_id, {})
             if for_user not in poll_tmp:
                 persisted = db_execute("SELECT slot FROM availability WHERE poll_id = ? AND user_id = ?", (poll_id, for_user), fetch=True)
+                # initialize temp with persisted slots so UI uses temp as the single source of truth
                 poll_tmp[for_user] = set(r[0] for r in persisted)
 
         day_rows = (len(DAYS) + 5 - 1) // 5
@@ -421,13 +422,13 @@ class AvailabilityDayView(discord.ui.View):
 
         day = DAYS[day_index]
         uid = for_user
+        # Now only consider the temp selection set for display and toggling.
         user_temp = temp_selections.get(poll_id, {}).get(uid, set())
-        persisted = set(r[0] for r in db_execute("SELECT slot FROM availability WHERE poll_id = ? AND user_id = ?", (poll_id, uid), fetch=True))
         for i, hour in enumerate(HOURS):
             btn = HourButton(poll_id, day, hour)
             btn.row = day_rows + (i // 5)
             slot = f"{day}-{hour}"
-            selected = (slot in user_temp) or (slot in persisted)
+            selected = (slot in user_temp)  # <- only temp, not persisted
             if selected:
                 btn.style = discord.ButtonStyle.success
                 btn.label = f"✅ {slot_label_range(day, hour)}"
@@ -444,7 +445,7 @@ class AvailabilityDayView(discord.ui.View):
         remove.row = controls_row
         self.add_item(submit)
         self.add_item(remove)
-
+      
 # in-memory temporary selections (cleared only when persisted or removed)
 temp_selections = {}
 
@@ -643,3 +644,4 @@ if __name__ == "__main__":
         raise SystemExit(1)
     init_db()
     bot.run(BOT_TOKEN)
+
