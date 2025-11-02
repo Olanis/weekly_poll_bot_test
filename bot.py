@@ -2,19 +2,18 @@
 """
 Weekly poll bot with persistent storage (SQLite) and weekly scheduling (Europe/Berlin).
 - Posts a poll every Sunday 12:00 (noon) Berlin time.
+- Posts a daily summary (matches + new ideas since yesterday) at 09:00 Europe/Berlin.
 - Stores polls, votes and availabilities in SQLite so data survives restarts.
 - Interactive availability editor is ephemeral (only visible to the invoking user).
 - "Matches anzeigen" button shows matches for options with >=2 voters.
 
-Before running:
-- Install requirements from requirements.txt
-- Set environment variable BOT_TOKEN to your bot token
-- (Optional) set CHANNEL_ID to the numeric channel id where polls should be posted,
-  otherwise use the startpoll command to post to a channel manually.
+Change in this version:
+- The daily summary will delete the previous daily summary message (if still present)
+  so that only one daily summary message exists in the channel at a time.
 """
 import os
 import sqlite3
-from datetime import datetime
+from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
 import discord
@@ -27,13 +26,13 @@ from apscheduler.triggers.cron import CronTrigger
 # -------------------------
 intents = discord.Intents.default()
 intents.members = True
-intents.message_content = True  # <-- nötig, damit prefix-Commands wie !startpoll funktionieren
+intents.message_content = True
 bot = commands.Bot(command_prefix="!", intents=intents)
 
 DB_PATH = os.getenv("POLL_DB", "polls.sqlite")
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 CHANNEL_ID = int(os.getenv("CHANNEL_ID", "0")) if os.getenv("CHANNEL_ID") else None
-POST_TIMEZONE = "Europe/Berlin"  # as requested
+POST_TIMEZONE = "Europe/Berlin"
 
 # -------------------------
 # Database helpers
@@ -50,13 +49,14 @@ def init_db():
         )
         """
     )
-    # options (ideas) table
+    # options (ideas) table (with created_at)
     cur.execute(
         """
         CREATE TABLE IF NOT EXISTS options (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             poll_id TEXT NOT NULL,
             option_text TEXT NOT NULL,
+            created_at TEXT NOT NULL,
             FOREIGN KEY(poll_id) REFERENCES polls(id)
         )
         """
@@ -86,6 +86,16 @@ def init_db():
         )
         """
     )
+    # daily_summaries table: store last summary message id per channel
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS daily_summaries (
+            channel_id INTEGER PRIMARY KEY,
+            message_id INTEGER,
+            created_at TEXT NOT NULL
+        )
+        """
+    )
     con.commit()
     con.close()
 
@@ -102,6 +112,18 @@ def db_execute(query, params=(), fetch=False, many=False):
     con.commit()
     con.close()
     return rows
+
+# helpers for daily_summaries
+def get_last_daily_summary(channel_id: int):
+    rows = db_execute("SELECT message_id FROM daily_summaries WHERE channel_id = ?", (channel_id,), fetch=True)
+    return rows[0][0] if rows and rows[0][0] is not None else None
+
+def set_last_daily_summary(channel_id: int, message_id: int):
+    now = datetime.utcnow().isoformat()
+    db_execute("INSERT OR REPLACE INTO daily_summaries(channel_id, message_id, created_at) VALUES (?, ?, ?)", (channel_id, message_id, now))
+
+def clear_last_daily_summary(channel_id: int):
+    db_execute("DELETE FROM daily_summaries WHERE channel_id = ?", (channel_id,))
 
 # -------------------------
 # Utilities
@@ -131,12 +153,13 @@ def create_poll_record(poll_id: str):
     db_execute("INSERT OR REPLACE INTO polls(id, created_at) VALUES (?, ?)", (poll_id, datetime.utcnow().isoformat()))
 
 def add_option(poll_id: str, option_text: str):
-    db_execute("INSERT INTO options(poll_id, option_text) VALUES (?, ?)", (poll_id, option_text))
-    rows = db_execute("SELECT id FROM options WHERE poll_id = ? AND option_text = ?", (poll_id, option_text), fetch=True)
+    created_at = datetime.utcnow().isoformat()
+    db_execute("INSERT INTO options(poll_id, option_text, created_at) VALUES (?, ?, ?)", (poll_id, option_text, created_at))
+    rows = db_execute("SELECT id FROM options WHERE poll_id = ? AND option_text = ? ORDER BY id DESC LIMIT 1", (poll_id, option_text), fetch=True)
     return rows[-1][0] if rows else None
 
 def get_options(poll_id: str):
-    return db_execute("SELECT id, option_text FROM options WHERE poll_id = ?", (poll_id,), fetch=True) or []
+    return db_execute("SELECT id, option_text, created_at FROM options WHERE poll_id = ? ORDER BY id ASC", (poll_id,), fetch=True) or []
 
 def add_vote(poll_id: str, option_id: int, user_id: int):
     try:
@@ -161,6 +184,10 @@ def persist_availability(poll_id: str, user_id: int, slots: list):
 def get_availability_for_poll(poll_id: str):
     return db_execute("SELECT user_id, slot FROM availability WHERE poll_id = ?", (poll_id,), fetch=True) or []
 
+def get_options_since(poll_id: str, since_dt: datetime):
+    rows = db_execute("SELECT option_text, created_at FROM options WHERE poll_id = ? AND created_at >= ? ORDER BY created_at ASC", (poll_id, since_dt.isoformat()), fetch=True)
+    return rows or []
+
 # -------------------------
 # Embed generation
 # -------------------------
@@ -177,7 +204,7 @@ def generate_poll_embed_from_db(poll_id: str, guild: discord.Guild | None = None
         timestamp=datetime.now()
     )
     total_votes = sum(len(v) for v in votes_map.values()) or 1
-    for opt_id, opt_text in options:
+    for opt_id, opt_text, _created in options:
         voters = votes_map.get(opt_id, [])
         percent = len(voters) / total_votes * 100
         header = f"🗳️ {len(voters)} Stimmen ({percent:.1f}%)"
@@ -219,7 +246,7 @@ class PollView(discord.ui.View):
         super().__init__(timeout=None)
         self.poll_id = poll_id
         options = get_options(poll_id)
-        for opt_id, opt_text in options:
+        for opt_id, opt_text, _ in options:
             self.add_item(PollButton(poll_id, opt_id, opt_text))
         self.add_item(AddOptionButton(poll_id))
         self.add_item(AddAvailabilityButton(poll_id))
@@ -232,23 +259,13 @@ class PollButton(discord.ui.Button):
         self.option_id = option_id
 
     async def callback(self, interaction: discord.Interaction):
-        """
-        Toggle vote for this option for the invoking user.
-        Previously the bot enforced single-choice (removed other votes).
-        Now users can vote for multiple options: clicking toggles their vote for this option.
-        """
         uid = interaction.user.id
-        # Check if user already voted for this option
         rows = db_execute("SELECT 1 FROM votes WHERE poll_id = ? AND option_id = ? AND user_id = ?", (self.poll_id, self.option_id, uid), fetch=True)
         if rows:
-            # user already voted -> remove vote (toggle off)
             remove_vote(self.poll_id, self.option_id, uid)
         else:
-            # add vote (toggle on)
             add_vote(self.poll_id, self.option_id, uid)
-
         embed = generate_poll_embed_from_db(self.poll_id, interaction.guild)
-        # re-create view to reflect any new options
         new_view = PollView(self.poll_id)
         await interaction.response.edit_message(embed=embed, view=new_view)
 
@@ -388,11 +405,20 @@ class AvailabilityDayView(discord.ui.View):
         self.poll_id = poll_id
         self.day_index = day_index
         self.for_user = for_user
+
+        # ensure temp_selections for this user is initialized from persisted values
+        if for_user is not None:
+            poll_tmp = temp_selections.setdefault(poll_id, {})
+            if for_user not in poll_tmp:
+                persisted = db_execute("SELECT slot FROM availability WHERE poll_id = ? AND user_id = ?", (poll_id, for_user), fetch=True)
+                poll_tmp[for_user] = set(r[0] for r in persisted)
+
         day_rows = (len(DAYS) + 5 - 1) // 5
         for idx in range(len(DAYS)):
             btn = DaySelectButton(poll_id, idx, selected=(idx == day_index))
             btn.row = idx // 5
             self.add_item(btn)
+
         day = DAYS[day_index]
         uid = for_user
         user_temp = temp_selections.get(poll_id, {}).get(uid, set())
@@ -409,6 +435,7 @@ class AvailabilityDayView(discord.ui.View):
                 btn.style = discord.ButtonStyle.secondary
                 btn.label = slot_label_range(day, hour)
             self.add_item(btn)
+
         last_hour_row = day_rows + ((len(HOURS) - 1) // 5)
         controls_row = min(4, last_hour_row + 1)
         submit = SubmitButton(poll_id)
@@ -435,7 +462,7 @@ def compute_matches_for_poll_from_db(poll_id: str):
     for uid, slot in availability_rows:
         avail_map.setdefault(uid, set()).add(slot)
     results = {}
-    for opt_id, opt_text in options:
+    for opt_id, opt_text, _ in options:
         voters = votes_map.get(opt_id, [])
         if len(voters) < 2:
             continue
@@ -463,6 +490,96 @@ async def post_poll_to_channel(channel: discord.abc.Messageable):
     return poll_id
 
 # -------------------------
+# Daily summary job
+# -------------------------
+async def post_daily_summary():
+    await bot.wait_until_ready()
+    # choose channel
+    channel = None
+    if CHANNEL_ID:
+        channel = bot.get_channel(CHANNEL_ID)
+    if not channel:
+        for g in bot.guilds:
+            for ch in g.text_channels:
+                try:
+                    perms = ch.permissions_for(g.me)
+                    if perms.send_messages:
+                        channel = ch
+                        break
+                except Exception:
+                    continue
+            if channel:
+                break
+    if not channel:
+        print("Kein Kanal gefunden für Daily Summary.")
+        return
+
+    # find the most recent poll (by created_at)
+    rows = db_execute("SELECT id, created_at FROM polls ORDER BY created_at DESC LIMIT 1", fetch=True)
+    if not rows:
+        await channel.send("ℹ️ Keine Polls vorhanden.")
+        return
+    poll_id, poll_created = rows[0]
+    # compute since yesterday
+    tz = ZoneInfo(POST_TIMEZONE)
+    since = datetime.now(tz) - timedelta(days=1)
+    new_options = get_options_since(poll_id, since)
+    # matches
+    matches = compute_matches_for_poll_from_db(poll_id)
+
+    embed = discord.Embed(title="🗓️ Tages-Update: Matches & neue Ideen", color=discord.Color.green(), timestamp=datetime.now())
+    # New options
+    if new_options:
+        lines = []
+        for opt_text, created_at in new_options:
+            try:
+                t = datetime.fromisoformat(created_at).astimezone(tz)
+                tstr = t.strftime("%d.%m. %H:%M")
+            except Exception:
+                tstr = created_at
+            lines.append(f"- {opt_text} (hinzugefügt {tstr})")
+        embed.add_field(name="🆕 Neue Ideen seit gestern", value="\n".join(lines), inline=False)
+    else:
+        embed.add_field(name="🆕 Neue Ideen seit gestern", value="Keine", inline=False)
+
+    # Matches
+    if matches:
+        for opt_text, infos in matches.items():
+            lines = []
+            for info in infos:
+                slot = info["slot"]
+                day, hour_s = slot.split("-")
+                hour = int(hour_s)
+                timestr = slot_label_range(day, hour)
+                names = [user_display_name(channel.guild if isinstance(channel, discord.TextChannel) else None, u) for u in info["users"]]
+                lines.append(f"{timestr}: {', '.join(names)}")
+            embed.add_field(name=f"🤝 Matches — {opt_text}", value="\n".join(lines), inline=False)
+    else:
+        embed.add_field(name="🤝 Matches", value="Keine gemeinsamen Zeiten für Optionen mit ≥2 Stimmen.", inline=False)
+
+    # delete previous daily summary in this channel (if any)
+    last_msg_id = get_last_daily_summary(channel.id)
+    if last_msg_id:
+        try:
+            prev = await channel.fetch_message(last_msg_id)
+            if prev:
+                await prev.delete()
+        except discord.NotFound:
+            # message gone already
+            pass
+        except Exception:
+            # ignore errors but do not stop posting new summary
+            pass
+
+    # send new summary and record message id
+    sent = await channel.send(embed=embed)
+    try:
+        set_last_daily_summary(channel.id, sent.id)
+    except Exception:
+        # non-fatal: continue
+        pass
+
+# -------------------------
 # Scheduler
 # -------------------------
 scheduler = AsyncIOScheduler(timezone=ZoneInfo(POST_TIMEZONE))
@@ -470,6 +587,11 @@ scheduler = AsyncIOScheduler(timezone=ZoneInfo(POST_TIMEZONE))
 def schedule_weekly_post():
     trigger = CronTrigger(day_of_week="sun", hour=12, minute=0, timezone=ZoneInfo(POST_TIMEZONE))
     scheduler.add_job(job_post_weekly, trigger=trigger, id="weekly_poll", replace_existing=True)
+
+def schedule_daily_summary():
+    # every day at 09:00 Europe/Berlin
+    trigger = CronTrigger(day_of_week="*", hour=9, minute=0, timezone=ZoneInfo(POST_TIMEZONE))
+    scheduler.add_job(post_daily_summary, trigger=trigger, id="daily_summary", replace_existing=True)
 
 async def job_post_weekly():
     await bot.wait_until_ready()
@@ -504,6 +626,7 @@ async def on_ready():
     if not scheduler.running:
         scheduler.start()
     schedule_weekly_post()
+    schedule_daily_summary()
 
 @bot.command()
 async def startpoll(ctx):
@@ -520,4 +643,3 @@ if __name__ == "__main__":
         raise SystemExit(1)
     init_db()
     bot.run(BOT_TOKEN)
-
