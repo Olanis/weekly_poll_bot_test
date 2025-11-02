@@ -194,20 +194,21 @@ def get_options_since(poll_id: str, since_dt: datetime):
 def generate_poll_embed_from_db(poll_id: str, guild: discord.Guild | None = None):
     options = get_options(poll_id)
     votes = get_votes_for_poll(poll_id)
+    # map option_id -> list of user_ids
     votes_map = {}
     for opt_id, uid in votes:
         votes_map.setdefault(opt_id, []).append(uid)
+
     embed = discord.Embed(
         title="📋 Worauf hast du diese Woche Lust?",
         description="Gib eigene Ideen ein, stimme ab oder trage deine Zeiten ein!",
         color=discord.Color.blurple(),
         timestamp=datetime.now()
     )
-    total_votes = sum(len(v) for v in votes_map.values()) or 1
+
     for opt_id, opt_text, _created in options:
         voters = votes_map.get(opt_id, [])
-        percent = len(voters) / total_votes * 100
-        header = f"🗳️ {len(voters)} Stimmen ({percent:.1f}%)"
+        header = f"🗳️ {len(voters)} Stimmen"
         if voters:
             names = [user_display_name(guild, uid) for uid in voters]
             if len(names) > 10:
@@ -220,18 +221,28 @@ def generate_poll_embed_from_db(poll_id: str, guild: discord.Guild | None = None
         else:
             value = header + "\n👥 Keine Stimmen"
 
+        # Verwende dieselbe Matches-Formatierung wie bei ShowMatchesButton
         if len(voters) >= 2:
+            # compute matches for this poll and option
             avail_rows = get_availability_for_poll(poll_id)
             slot_map = {}
             for uid, slot in avail_rows:
                 if uid in voters:
                     slot_map.setdefault(slot, []).append(uid)
-            common = [s for s, ulist in slot_map.items() if len(ulist) >= 2]
+            common = [ (s, ulist) for s, ulist in slot_map.items() if len(ulist) >= 2 ]
             if common:
-                readable = ", ".join([f"{s.split('-')[0]}. {format_slot_range(s)}" for s in common])
-                value += f"\n✅ Gemeinsame Zeit: {readable}"
+                # formatiere wie ShowMatches: "Fr. 18:00 - 19:00: Name1, Name2"
+                lines = []
+                for s, ulist in common:
+                    day, hour_s = s.split("-")
+                    hour = int(hour_s)
+                    timestr = slot_label_range(day, hour)
+                    names = [user_display_name(guild, u) for u in ulist]
+                    lines.append(f"{timestr}: {', '.join(names)}")
+                value += "\n✅ Gemeinsame Zeit:\n" + "\n".join(lines)
 
         embed.add_field(name=opt_text or "(ohne Titel)", value=value, inline=False)
+
     return embed
 
 def format_slot_range(slot: str) -> str:
@@ -644,4 +655,5 @@ if __name__ == "__main__":
         raise SystemExit(1)
     init_db()
     bot.run(BOT_TOKEN)
+
 
