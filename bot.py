@@ -5,11 +5,7 @@ Weekly poll bot with persistent storage (SQLite) and weekly scheduling (Europe/B
 - Posts a daily summary (matches + new ideas since yesterday) at 09:00 Europe/Berlin.
 - Stores polls, votes and availabilities in SQLite so data survives restarts.
 - Interactive availability editor is ephemeral (only visible to the invoking user).
-- "Matches anzeigen" button shows matches for options with >=2 voters.
-
-Change in this version:
-- The daily summary will delete the previous daily summary message (if still present)
-  so that only one daily summary message exists in the channel at a time.
+- Matches are shown directly in the poll embed; the "Matches anzeigen" button has been removed.
 """
 import os
 import sqlite3
@@ -221,9 +217,8 @@ def generate_poll_embed_from_db(poll_id: str, guild: discord.Guild | None = None
         else:
             value = header + "\n👥 Keine Stimmen"
 
-        # Verwende dieselbe Matches-Formatierung wie bei ShowMatchesButton
+        # compute matches for this poll and option and format like the matches view
         if len(voters) >= 2:
-            # compute matches for this poll and option
             avail_rows = get_availability_for_poll(poll_id)
             slot_map = {}
             for uid, slot in avail_rows:
@@ -231,7 +226,6 @@ def generate_poll_embed_from_db(poll_id: str, guild: discord.Guild | None = None
                     slot_map.setdefault(slot, []).append(uid)
             common = [ (s, ulist) for s, ulist in slot_map.items() if len(ulist) >= 2 ]
             if common:
-                # formatiere wie ShowMatches: "Fr. 18:00 - 19:00: Name1, Name2"
                 lines = []
                 for s, ulist in common:
                     day, hour_s = s.split("-")
@@ -261,7 +255,7 @@ class PollView(discord.ui.View):
             self.add_item(PollButton(poll_id, opt_id, opt_text))
         self.add_item(AddOptionButton(poll_id))
         self.add_item(AddAvailabilityButton(poll_id))
-        self.add_item(ShowMatchesButton(poll_id))
+        # Note: ShowMatchesButton removed — matches shown in the embed itself
 
 class PollButton(discord.ui.Button):
     def __init__(self, poll_id: str, option_id: int, option_text: str):
@@ -321,29 +315,6 @@ class AddAvailabilityButton(discord.ui.Button):
             timestamp=datetime.now()
         )
         await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
-
-class ShowMatchesButton(discord.ui.Button):
-    def __init__(self, poll_id: str):
-        super().__init__(label="🤝 Matches anzeigen", style=discord.ButtonStyle.primary)
-        self.poll_id = poll_id
-
-    async def callback(self, interaction: discord.Interaction):
-        results = compute_matches_for_poll_from_db(self.poll_id)
-        if not results:
-            await interaction.response.send_message("ℹ️ Keine Matches (keine gemeinsamen Stunden für Optionen mit ≥2 Stimmen).", ephemeral=True)
-            return
-        embed = discord.Embed(title="🤝 Gefundene Matches", color=discord.Color.blurple(), timestamp=datetime.now())
-        for option_text, infos in results.items():
-            lines = []
-            for info in infos:
-                slot = info["slot"]
-                day, hour_s = slot.split("-")
-                hour = int(hour_s)
-                timestr = slot_label_range(day, hour)
-                names = [user_display_name(interaction.guild, u) for u in info["users"]]
-                lines.append(f"{timestr}: {', '.join(names)}")
-            embed.add_field(name=option_text or "(ohne Titel)", value="\n".join(lines), inline=False)
-        await interaction.response.send_message(embed=embed, ephemeral=True)
 
 # Availability view/buttons (ephemeral)
 class DaySelectButton(discord.ui.Button):
@@ -456,7 +427,7 @@ class AvailabilityDayView(discord.ui.View):
         remove.row = controls_row
         self.add_item(submit)
         self.add_item(remove)
-      
+
 # in-memory temporary selections (cleared only when persisted or removed)
 temp_selections = {}
 
@@ -655,5 +626,3 @@ if __name__ == "__main__":
         raise SystemExit(1)
     init_db()
     bot.run(BOT_TOKEN)
-
-
