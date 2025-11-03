@@ -7,6 +7,7 @@ Weekly poll bot with persistent storage (SQLite) and weekly scheduling (Europe/B
 - Interactive availability editor is ephemeral (only visible to the invoking user).
 - Matches are shown directly in the poll embed.
 - "🛠️ Ideen bearbeiten" opens an ephemeral view listing the invoking user's own ideas with ✖️ delete buttons.
+- Added manual command: !dailysummary to post/update the daily summary in the current channel.
 """
 import os
 import sqlite3
@@ -397,12 +398,10 @@ class EditOptionsView(discord.ui.View):
         user_opts = get_user_options(poll_id, user_id)
         # if many options, create a delete button per option
         for opt_id, opt_text, created in user_opts:
-            # add a non-interactive label as a Button with disabled True to show text (since Views can't contain plain text)
-            # However discord UI doesn't have a plain label element; we emulate by adding a disabled secondary button with option text
+            # display label (disabled) then delete button
             label = opt_text if len(opt_text) <= 80 else opt_text[:77] + "..."
             display_btn = discord.ui.Button(label=label, style=discord.ButtonStyle.secondary, disabled=True)
             self.add_item(display_btn)
-            # add delete button for this option
             del_btn = DeleteOwnOptionButton(poll_id, opt_id, opt_text, user_id)
             self.add_item(del_btn)
 
@@ -563,11 +562,12 @@ async def post_poll_to_channel(channel: discord.abc.Messageable):
     return poll_id
 
 # -------------------------
-# Daily summary job
+# Daily summary helpers
 # -------------------------
 async def post_daily_summary():
+    """Original scheduled daily summary that selects channel by CHANNEL_ID or first sendable channel."""
     await bot.wait_until_ready()
-    # choose channel
+    # choose channel same as before
     channel = None
     if CHANNEL_ID:
         channel = bot.get_channel(CHANNEL_ID)
@@ -586,7 +586,12 @@ async def post_daily_summary():
     if not channel:
         print("Kein Kanal gefunden für Daily Summary.")
         return
+    await post_daily_summary_to(channel)
 
+async def post_daily_summary_to(channel: discord.TextChannel):
+    """Post or update the daily summary specifically into the given channel.
+    This is used by the scheduled job and by the manual !dailysummary command.
+    """
     # find the most recent poll (by created_at)
     rows = db_execute("SELECT id, created_at FROM polls ORDER BY created_at DESC LIMIT 1", fetch=True)
     if not rows:
@@ -697,6 +702,13 @@ async def startpoll(ctx):
     """Manually post a poll in the current channel."""
     poll_id = await post_poll_to_channel(ctx.channel)
     await ctx.send(f"Poll gepostet (id={poll_id})", delete_after=8)
+
+@bot.command()
+async def dailysummary(ctx):
+    """Manually post/update the daily summary in the current channel."""
+    # permission: allow anyone to trigger; optional: restrict to admins by checking ctx.author.guild_permissions.manage_guild
+    await post_daily_summary_to(ctx.channel)
+    await ctx.send("✅ Daily Summary gesendet.", delete_after=6)
 
 @bot.command()
 async def deleteidea(ctx, option_id: int):
