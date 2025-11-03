@@ -6,13 +6,12 @@ Weekly poll bot with persistent storage (SQLite) and weekly scheduling (Europe/B
 - Stores polls, votes and availabilities in SQLite so data survives restarts.
 - Interactive availability editor is ephemeral (only visible to the invoking user).
 - Matches are shown directly in the poll embed.
-- Added: singular/plural "Stimme"/"Stimmen" and !deleteidea command to let authors delete their own ideas.
+- "🛠️ Ideen bearbeiten" opens an ephemeral view listing the invoking user's own ideas with ✖️ delete buttons.
 """
 import os
 import sqlite3
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
-import asyncio
 
 import discord
 from discord.ext import commands
@@ -187,6 +186,9 @@ def get_options_since(poll_id: str, since_dt: datetime):
     rows = db_execute("SELECT option_text, created_at FROM options WHERE poll_id = ? AND created_at >= ? ORDER BY created_at ASC", (poll_id, since_dt.isoformat()), fetch=True)
     return rows or []
 
+def get_user_options(poll_id: str, user_id: int):
+    return db_execute("SELECT id, option_text, created_at FROM options WHERE poll_id = ? AND author_id = ? ORDER BY id ASC", (poll_id, user_id), fetch=True) or []
+
 # -------------------------
 # Embed generation
 # -------------------------
@@ -207,12 +209,9 @@ def generate_poll_embed_from_db(poll_id: str, guild: discord.Guild | None = None
 
     for opt_id, opt_text, _created, author_id in options:
         voters = votes_map.get(opt_id, [])
-        # singular/plural "Stimme"/"Stimmen"
+        # singular/plural
         count = len(voters)
-        if count == 1:
-            header = f"🗳️ 1 Stimme"
-        else:
-            header = f"🗳️ {count} Stimmen"
+        header = f"🗳️ {count} Stimme" if count == 1 else f"🗳️ {count} Stimmen"
 
         if voters:
             names = [user_display_name(guild, uid) for uid in voters]
@@ -244,9 +243,8 @@ def generate_poll_embed_from_db(poll_id: str, guild: discord.Guild | None = None
                     lines.append(f"{timestr}: {', '.join(names)}")
                 value += "\n✅ Gemeinsame Zeit:\n" + "\n".join(lines)
 
-        # show option id so users can delete their own ideas with !deleteidea <id>
-        field_name = f"{opt_text or '(ohne Titel)'}  (id:{opt_id})"
-        embed.add_field(name=field_name, value=value, inline=False)
+        # show option text only (no id)
+        embed.add_field(name=opt_text or "(ohne Titel)", value=value, inline=False)
 
     return embed
 
@@ -266,7 +264,8 @@ class PollView(discord.ui.View):
             self.add_item(PollButton(poll_id, opt_id, opt_text))
         self.add_item(AddOptionButton(poll_id))
         self.add_item(AddAvailabilityButton(poll_id))
-        # ShowMatchesButton removed — matches are shown in embed now.
+        # EditOptionsButton present for all users, but it only opens an edit view when the clicker has own options
+        self.add_item(EditOptionsButton(poll_id))
 
 class PollButton(discord.ui.Button):
     def __init__(self, poll_id: str, option_id: int, option_text: str):
@@ -307,13 +306,13 @@ class SuggestModal(discord.ui.Modal, title="Neue Idee hinzufügen"):
         opt_id = add_option(self.poll_id, text, author_id=interaction.user.id)
         embed = generate_poll_embed_from_db(self.poll_id, interaction.guild)
         new_view = PollView(self.poll_id)
-        # try to update polling message if possible (best-effort)
+        # try to update the poll message if possible (best-effort)
         try:
             if interaction.message:
                 await interaction.message.edit(embed=embed, view=new_view)
         except Exception:
             pass
-        await interaction.response.send_message(f"✅ Idee hinzugefügt (id:{opt_id}): {text}", ephemeral=True)
+        await interaction.response.send_message(f"✅ Idee hinzugefügt.", ephemeral=True)
 
 class AddAvailabilityButton(discord.ui.Button):
     def __init__(self, poll_id: str):
@@ -328,6 +327,84 @@ class AddAvailabilityButton(discord.ui.Button):
             timestamp=datetime.now()
         )
         await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
+
+class EditOptionsButton(discord.ui.Button):
+    def __init__(self, poll_id: str):
+        super().__init__(label="🛠️ Ideen bearbeiten", style=discord.ButtonStyle.secondary)
+        self.poll_id = poll_id
+
+    async def callback(self, interaction: discord.Interaction):
+        user_id = interaction.user.id
+        user_opts = get_user_options(self.poll_id, user_id)
+        if not user_opts:
+            await interaction.response.send_message("ℹ️ Du hast noch keine eigenen Ideen in dieser Umfrage.", ephemeral=True)
+            return
+        view = EditOptionsView(self.poll_id, user_id)
+        await interaction.response.send_message("🛠️ Deine Ideen (nur für dich sichtbar):", view=view, ephemeral=True)
+
+# EditOptions ephemeral view & delete buttons
+class DeleteOwnOptionButton(discord.ui.Button):
+    def __init__(self, poll_id: str, option_id: int, option_text: str, user_id: int):
+        label = "✖️"
+        super().__init__(label=label, style=discord.ButtonStyle.danger)
+        self.poll_id = poll_id
+        self.option_id = option_id
+        self.option_text = option_text
+        self.user_id = user_id
+
+    async def callback(self, interaction: discord.Interaction):
+        # verify author
+        if interaction.user.id != self.user_id:
+            await interaction.response.send_message("❌ Du kannst nur deine eigenen Ideen löschen.", ephemeral=True)
+            return
+        # delete option and associated votes
+        db_execute("DELETE FROM options WHERE id = ?", (self.option_id,))
+        db_execute("DELETE FROM votes WHERE option_id = ?", (self.option_id,))
+        await interaction.response.send_message(f"✅ Idee gelöscht: {self.option_text}", ephemeral=True)
+        # try to update the most recent poll message in the channel where the edit was invoked (best-effort)
+        try:
+            channel = interaction.channel
+            async for msg in channel.history(limit=200):
+                if msg.author == bot.user and msg.embeds:
+                    em = msg.embeds[0]
+                    if em.title and em.title.startswith("📋 Worauf"):
+                        # attempt to find poll id (we take most recent poll in DB)
+                        rows = db_execute("SELECT id FROM polls ORDER BY created_at DESC LIMIT 1", fetch=True)
+                        if rows:
+                            poll_id = rows[0][0]
+                            new_embed = generate_poll_embed_from_db(poll_id, interaction.guild)
+                            new_view = PollView(poll_id)
+                            try:
+                                await msg.edit(embed=new_embed, view=new_view)
+                            except Exception:
+                                pass
+                        break
+        except Exception:
+            pass
+        # also refresh the EditOptionsView: send an updated ephemeral view if possible
+        try:
+            # create a refreshed view and re-send ephemeral (best-effort)
+            refreshed = EditOptionsView(self.poll_id, self.user_id)
+            await interaction.followup.send("🔄 Aktualisierte Liste deiner Ideen:", view=refreshed, ephemeral=True)
+        except Exception:
+            pass
+
+class EditOptionsView(discord.ui.View):
+    def __init__(self, poll_id: str, user_id: int):
+        super().__init__(timeout=None)
+        self.poll_id = poll_id
+        self.user_id = user_id
+        user_opts = get_user_options(poll_id, user_id)
+        # if many options, create a delete button per option
+        for opt_id, opt_text, created in user_opts:
+            # add a non-interactive label as a Button with disabled True to show text (since Views can't contain plain text)
+            # However discord UI doesn't have a plain label element; we emulate by adding a disabled secondary button with option text
+            label = opt_text if len(opt_text) <= 80 else opt_text[:77] + "..."
+            display_btn = discord.ui.Button(label=label, style=discord.ButtonStyle.secondary, disabled=True)
+            self.add_item(display_btn)
+            # add delete button for this option
+            del_btn = DeleteOwnOptionButton(poll_id, opt_id, opt_text, user_id)
+            self.add_item(del_btn)
 
 # Availability view/buttons (ephemeral)
 class DaySelectButton(discord.ui.Button):
@@ -623,7 +700,8 @@ async def startpoll(ctx):
 
 @bot.command()
 async def deleteidea(ctx, option_id: int):
-    """Delete your own idea by option id: !deleteidea <id>"""
+    """Delete your own idea by option id: !deleteidea <id>
+    (kept for compatibility if you still want to use IDs)"""
     rows = db_execute("SELECT poll_id, option_text, author_id FROM options WHERE id = ?", (option_id,), fetch=True)
     if not rows:
         await ctx.send(f"❌ Idee mit id {option_id} nicht gefunden.")
@@ -638,23 +716,23 @@ async def deleteidea(ctx, option_id: int):
     # delete option and associated votes
     db_execute("DELETE FROM options WHERE id = ?", (option_id,))
     db_execute("DELETE FROM votes WHERE option_id = ?", (option_id,))
-    await ctx.send(f"✅ Deine Idee (id:{option_id}) wurde gelöscht.", delete_after=8)
-
-    # try to find and update the most recent poll message in this channel (best-effort)
+    await ctx.send(f"✅ Deine Idee wurde gelöscht.", delete_after=8)
+    # try to update the most recent poll message in this channel (best-effort)
     try:
         async for msg in ctx.channel.history(limit=100):
             if msg.author == bot.user and msg.embeds:
                 em = msg.embeds[0]
                 if em.title and em.title.startswith("📋 Worauf"):
-                    # update this message's embed if it belongs to the same poll (best-effort by checking fields)
-                    try:
-                        # attempt to extract poll_id from DB (we have poll_id)
+                    rows = db_execute("SELECT id FROM polls ORDER BY created_at DESC LIMIT 1", fetch=True)
+                    if rows:
+                        poll_id = rows[0][0]
                         new_embed = generate_poll_embed_from_db(poll_id, ctx.guild)
                         new_view = PollView(poll_id)
-                        await msg.edit(embed=new_embed, view=new_view)
-                        break
-                    except Exception:
-                        continue
+                        try:
+                            await msg.edit(embed=new_embed, view=new_view)
+                        except Exception:
+                            pass
+                    break
     except Exception:
         pass
 
