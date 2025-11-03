@@ -2,16 +2,19 @@
 """
 Weekly poll bot with persistent storage (SQLite) and weekly scheduling (Europe/Berlin).
 
-Changes in this version:
-- Daily summary (scheduled) runs twice: 09:00 and 18:00 Europe/Berlin.
-  - The 18:00 reminder will also be sent, but the summary text no longer says "seit gestern" /
-    it uses neutral wording like "Neue Ideen" and "Matches".
-  - Both scheduled runs (and the manual !dailysummary) only post when there are new ideas OR matches.
-  - The daily summary message is stored per-channel and the previous summary is deleted before posting.
-- When a vote is cast/removed, the poll embed is regenerated immediately (as before) and the matches shown
-  are limited to the slot(s) with the maximum number of users (i.e., the most popular common time(s))
-  per option.
-- Uses timezone-aware timestamps for DB records.
+Features included in this version:
+- Weekly poll posting (Sunday 12:00 Europe/Berlin).
+- Daily summaries posted at 09:00 and 18:00 Europe/Berlin (only if there are new ideas OR matches).
+  - The summary uses neutral wording ("Neue Ideen", not "seit gestern").
+  - Previous daily summary message in the same channel is deleted and replaced (message_id persisted).
+  - Summary includes a list of voters who haven't added availability.
+- Polls with options (ideas), voting, and availability per user.
+- "📝 Idee hinzufügen" opens a modal to suggest an idea (author_id stored).
+- A small gear button (⚙️) opens an ephemeral view listing only the clicker's own ideas with ✖️ delete buttons.
+  - The deletion is visible only to the author (in the ephemeral view) and updates the public poll message best-effort.
+- When someone votes (or removes a vote) the poll embed is regenerated and matches are recalculated immediately.
+  - For each option only the slot(s) with the maximum number of common users ("most popular" matches) are shown.
+- Timezone-aware timestamps for DB records.
 """
 import os
 import sqlite3
@@ -195,12 +198,44 @@ def get_options_since(poll_id: str, since_dt: datetime):
     return rows or []
 
 # -------------------------
-# Embed generation
+# Matching & Embed generation
 # -------------------------
+def compute_matches_for_poll_from_db(poll_id: str):
+    """
+    Returns dict: option_text -> list of {"slot": slot, "users": [user_ids]}.
+    For each option only the slot(s) with the maximum number of users are included.
+    """
+    options = get_options(poll_id)
+    votes = get_votes_for_poll(poll_id)
+    votes_map = {}
+    for opt_id, uid in votes:
+        votes_map.setdefault(opt_id, []).append(uid)
+    availability_rows = get_availability_for_poll(poll_id)
+    avail_map = {}
+    for uid, slot in availability_rows:
+        avail_map.setdefault(uid, set()).add(slot)
+    results = {}
+    for opt_id, opt_text, _created, _author in options:
+        voters = votes_map.get(opt_id, [])
+        if len(voters) < 2:
+            continue
+        slot_to_users = {}
+        for u in voters:
+            for s in avail_map.get(u, set()):
+                slot_to_users.setdefault(s, []).append(u)
+        common_slots = []
+        for s, users in slot_to_users.items():
+            if len(users) >= 2:
+                common_slots.append({"slot": s, "users": users})
+        if common_slots:
+            max_count = max(len(info["users"]) for info in common_slots)
+            best = [info for info in common_slots if len(info["users"]) == max_count]
+            results[opt_text] = best
+    return results
+
 def generate_poll_embed_from_db(poll_id: str, guild: discord.Guild | None = None):
     options = get_options(poll_id)
     votes = get_votes_for_poll(poll_id)
-    # map option_id -> list of user_ids
     votes_map = {}
     for opt_id, uid in votes:
         votes_map.setdefault(opt_id, []).append(uid)
@@ -236,14 +271,10 @@ def generate_poll_embed_from_db(poll_id: str, guild: discord.Guild | None = None
             for uid, slot in avail_rows:
                 if uid in voters:
                     slot_map.setdefault(slot, []).append(uid)
-            # collect only slots with >=2 users
             common = [(s, ulist) for s, ulist in slot_map.items() if len(ulist) >= 2]
             if common:
-                # find maximum participant count among common slots
                 max_count = max(len(ulist) for (_, ulist) in common)
-                # filter to only slots with that max_count
                 best = [(s, ulist) for (s, ulist) in common if len(ulist) == max_count]
-                # format best slots
                 lines = []
                 for s, ulist in best:
                     day, hour_s = s.split("-")
@@ -282,7 +313,7 @@ class SuggestModal(discord.ui.Modal, title="Neue Idee hinzufügen"):
                 await interaction.message.edit(embed=embed, view=new_view)
         except Exception:
             pass
-        await interaction.response.send_message(f"✅ Idee hinzugefügt.", ephemeral=True)
+        await interaction.response.send_message("✅ Idee hinzugefügt.", ephemeral=True)
 
 class AddOptionButton(discord.ui.Button):
     def __init__(self, poll_id: str):
@@ -305,7 +336,7 @@ class AddAvailabilityButton(discord.ui.Button):
         )
         await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
 
-# Open-edit button (icon-only gear as requested)
+# Open-edit button (icon-only gear)
 class OpenEditOwnIdeasButton(discord.ui.Button):
     def __init__(self, poll_id: str):
         super().__init__(label="⚙️", style=discord.ButtonStyle.secondary)
@@ -334,6 +365,7 @@ class DeleteOwnOptionButtonEphemeral(discord.ui.Button):
         db_execute("DELETE FROM options WHERE id = ?", (self.option_id,))
         db_execute("DELETE FROM votes WHERE option_id = ?", (self.option_id,))
         await interaction.response.send_message(f"✅ Idee gelöscht: {self.option_text}", ephemeral=True)
+        # update public poll message best-effort
         try:
             channel = interaction.channel
             async for msg in channel.history(limit=200):
@@ -352,6 +384,7 @@ class DeleteOwnOptionButtonEphemeral(discord.ui.Button):
                         break
         except Exception:
             pass
+        # refresh ephemeral view
         try:
             refreshed = EditOwnIdeasView(self.poll_id, self.user_id)
             await interaction.followup.send("🔄 Aktualisierte Liste deiner Ideen:", view=refreshed, ephemeral=True)
@@ -375,7 +408,7 @@ class EditOwnIdeasView(discord.ui.View):
                 del_btn = DeleteOwnOptionButtonEphemeral(poll_id, opt_id, opt_text, user_id)
                 self.add_item(del_btn)
 
-# Availability view/buttons (ephemeral)
+# Availability UI (ephemeral)
 class DaySelectButton(discord.ui.Button):
     def __init__(self, poll_id: str, day_index: int, selected: bool = False):
         label = f"{DAYS[day_index]}."
@@ -490,6 +523,7 @@ class PollView(discord.ui.View):
         options = get_options(poll_id)
         for opt_id, opt_text, _created, author_id in options:
             self.add_item(PollButton(poll_id, opt_id, opt_text))
+        # action buttons
         self.add_item(AddOptionButton(poll_id))
         self.add_item(AddAvailabilityButton(poll_id))
         self.add_item(OpenEditOwnIdeasButton(poll_id))
@@ -506,41 +540,10 @@ class PollButton(discord.ui.Button):
             remove_vote(self.poll_id, self.option_id, uid)
         else:
             add_vote(self.poll_id, self.option_id, uid)
-        # regenerate embed so matches update immediately; PollView construction uses generate_poll_embed_from_db
+        # regenerate embed so matches update immediately
         embed = generate_poll_embed_from_db(self.poll_id, interaction.guild)
         new_view = PollView(self.poll_id)
         await interaction.response.edit_message(embed=embed, view=new_view)
-
-# compute_matches_for_poll_from_db remains as before but generate_poll_embed_from_db now shows top matches only
-def compute_matches_for_poll_from_db(poll_id: str):
-    options = get_options(poll_id)
-    votes = get_votes_for_poll(poll_id)
-    votes_map = {}
-    for opt_id, uid in votes:
-        votes_map.setdefault(opt_id, []).append(uid)
-    availability_rows = get_availability_for_poll(poll_id)
-    avail_map = {}
-    for uid, slot in availability_rows:
-        avail_map.setdefault(uid, set()).add(slot)
-    results = {}
-    for opt_id, opt_text, _created, _author in options:
-        voters = votes_map.get(opt_id, [])
-        if len(voters) < 2:
-            continue
-        slot_to_users = {}
-        for u in voters:
-            for s in avail_map.get(u, set()):
-                slot_to_users.setdefault(s, []).append(u)
-        common_slots = []
-        for s, users in slot_to_users.items():
-            if len(users) >= 2:
-                common_slots.append({"slot": s, "users": users})
-        if common_slots:
-            # keep only the entries with the maximum user count
-            max_count = max(len(info["users"]) for info in common_slots)
-            best = [info for info in common_slots if len(info["users"]) == max_count]
-            results[opt_text] = best
-    return results
 
 # -------------------------
 # Posting polls
@@ -620,7 +623,25 @@ async def post_daily_summary_to(channel: discord.TextChannel):
     else:
         embed.add_field(name="🤝 Matches", value="Keine gemeinsamen Zeiten für Optionen mit ≥2 Stimmen.", inline=False)
 
-    # delete previous daily summary message in this channel if recorded
+    # Add list of voters without availability
+    voter_rows = db_execute("SELECT DISTINCT user_id FROM votes WHERE poll_id = ?", (poll_id,), fetch=True)
+    voters = [r[0] for r in voter_rows] if voter_rows else []
+    avail_rows = db_execute("SELECT DISTINCT user_id FROM availability WHERE poll_id = ?", (poll_id,), fetch=True)
+    has_avail = {r[0] for r in avail_rows} if avail_rows else set()
+    voters_no_avail = [uid for uid in voters if uid not in has_avail]
+    if voters_no_avail:
+        names = [user_display_name(channel.guild if isinstance(channel, discord.TextChannel) else None, uid) for uid in voters_no_avail]
+        if len(names) > 30:
+            shown = names[:30]
+            remaining = len(names) - 30
+            names_line = ", ".join(shown) + f", und {remaining} weitere..."
+        else:
+            names_line = ", ".join(names)
+        embed.add_field(name="ℹ️ Abstimmende ohne eingetragene Zeiten", value=names_line, inline=False)
+    else:
+        embed.add_field(name="ℹ️ Abstimmende ohne eingetragene Zeiten", value="Alle Abstimmenden haben Zeiten eingetragen.", inline=False)
+
+    # delete previous daily summary in this channel (if any)
     last_msg_id = get_last_daily_summary(channel.id)
     if last_msg_id:
         try:
@@ -639,7 +660,7 @@ async def post_daily_summary_to(channel: discord.TextChannel):
         pass
 
 # -------------------------
-# Scheduler: add 18:00 job in addition to 09:00
+# Scheduler: 09:00 and 18:00
 # -------------------------
 scheduler = AsyncIOScheduler(timezone=ZoneInfo(POST_TIMEZONE))
 
@@ -648,10 +669,8 @@ def schedule_weekly_post():
     scheduler.add_job(job_post_weekly, trigger=trigger, id="weekly_poll", replace_existing=True)
 
 def schedule_daily_summary():
-    # 09:00 job
     trigger_morning = CronTrigger(day_of_week="*", hour=9, minute=0, timezone=ZoneInfo(POST_TIMEZONE))
     scheduler.add_job(post_daily_summary, trigger=trigger_morning, id="daily_summary_morning", replace_existing=True)
-    # 18:00 job (evening reminder)
     trigger_evening = CronTrigger(day_of_week="*", hour=18, minute=0, timezone=ZoneInfo(POST_TIMEZONE))
     scheduler.add_job(post_daily_summary, trigger=trigger_evening, id="daily_summary_evening", replace_existing=True)
 
