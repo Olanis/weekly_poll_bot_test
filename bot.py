@@ -1,8 +1,11 @@
 #!/usr/bin/env python3
 """
-Stepwise bot — add reminder scheduling (24h and 2h) with robust NotFound handling.
+Stepwise bot — added RSVP UI (buttons) and persistence.
 
-Replace the running bot.py with this file and restart the container.
+Replace your current bot.py with this file and restart the container.
+This file extends the previously running reminder-enabled bot:
+- Adds EventView with RSVP buttons that persist to event_rsvps table.
+- Updates posted event message embed after RSVP changes.
 """
 from __future__ import annotations
 
@@ -77,19 +80,19 @@ def db_execute(query: str, params=(), fetch=False, many=False):
     finally:
         con.close()
 
-# scheduler
+# scheduler (reminder scheduling kept)
 scheduler = AsyncIOScheduler(timezone=ZoneInfo(POST_TIMEZONE))
 
-# placeholder view for reminders (we will later replace with RSVP view)
-class EventViewPlaceholder(discord.ui.View):
-    def __init__(self, discord_event_id: str):
-        super().__init__(timeout=None)
-        self.discord_event_id = discord_event_id
-
-# Helper: build a simple embed for the event from DB
-def build_event_embed_from_db(discord_event_id: str):
+# -------------------------
+# Helper: build event embed (shows RSVP counts)
+# -------------------------
+def build_event_embed_from_db(discord_event_id: str, guild: discord.Guild | None = None):
     rows = db_execute("SELECT discord_event_id, start_time FROM tracked_events WHERE discord_event_id = ?", (discord_event_id,), fetch=True) or []
     start_time = rows[0][1] if rows else None
+    r = db_execute("SELECT status, COUNT(*) FROM event_rsvps WHERE discord_event_id = ? GROUP BY status", (discord_event_id,), fetch=True) or []
+    counts = {row[0]: row[1] for row in r}
+    interested = counts.get("interested", 0)
+    going = counts.get("going", 0)
     embed = discord.Embed(title="📣 Event", description="Details", color=discord.Color.blurple(), timestamp=datetime.now(timezone.utc))
     if start_time:
         try:
@@ -97,13 +100,65 @@ def build_event_embed_from_db(discord_event_id: str):
             embed.add_field(name="Start", value=dt.astimezone(ZoneInfo(POST_TIMEZONE)).strftime("%d.%m.%Y %H:%M %Z"), inline=False)
         except Exception:
             embed.add_field(name="Start", value=start_time, inline=False)
-    # RSVP count (basic)
-    r = db_execute("SELECT user_id FROM event_rsvps WHERE discord_event_id = ?", (discord_event_id,), fetch=True) or []
-    names = [str(x[0]) for x in r]
-    embed.add_field(name="Interessierte", value=", ".join(names) if names else "Keine", inline=False)
+    embed.add_field(name="🔔 Interessiert", value=str(interested), inline=True)
+    embed.add_field(name="✅ Nehme teil", value=str(going), inline=True)
     return embed
 
-# Reminder coroutine: robustly delete old tracked message if needed, post new reminder, update DB
+# -------------------------
+# Event view: RSVP buttons
+# -------------------------
+class EventRSVPView(discord.ui.View):
+    def __init__(self, discord_event_id: str, guild: discord.Guild | None):
+        super().__init__(timeout=None)
+        self.discord_event_id = discord_event_id
+        self.guild = guild
+
+    @discord.ui.button(label="🔔 Interessiert", style=discord.ButtonStyle.secondary, custom_id=None)
+    async def btn_interested(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._handle_rsvp(interaction, "interested")
+
+    @discord.ui.button(label="✅ Nehme teil", style=discord.ButtonStyle.success, custom_id=None)
+    async def btn_going(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._handle_rsvp(interaction, "going")
+
+    async def _handle_rsvp(self, interaction: discord.Interaction, status: str):
+        uid = interaction.user.id
+        did = self.discord_event_id
+        try:
+            # toggle: if same status exists -> remove; else upsert
+            existing = db_execute("SELECT status FROM event_rsvps WHERE discord_event_id = ? AND user_id = ?", (did, uid), fetch=True)
+            if existing and existing[0][0] == status:
+                db_execute("DELETE FROM event_rsvps WHERE discord_event_id = ? AND user_id = ?", (did, uid))
+                await interaction.response.send_message(f"Deine {status} RSVP wurde entfernt.", ephemeral=True)
+            else:
+                db_execute("INSERT OR REPLACE INTO event_rsvps(discord_event_id, user_id, status) VALUES (?, ?, ?)", (did, uid, status))
+                await interaction.response.send_message(f"Dein RSVP wurde gesetzt: {status}.", ephemeral=True)
+            # update public posted message if present
+            tracked = db_execute("SELECT posted_channel_id, posted_message_id FROM tracked_events WHERE discord_event_id = ?", (did,), fetch=True)
+            if tracked:
+                ch_id, msg_id = tracked[0]
+                ch = bot.get_channel(ch_id) if ch_id else None
+                if ch and msg_id:
+                    try:
+                        msg = await ch.fetch_message(msg_id)
+                        if msg:
+                            embed = build_event_embed_from_db(did, self.guild)
+                            await msg.edit(embed=embed, view=EventRSVPView(did, self.guild))
+                    except discord.NotFound:
+                        # message missing: clear DB refs
+                        db_execute("UPDATE tracked_events SET posted_channel_id = NULL, posted_message_id = NULL WHERE discord_event_id = ?", (did,))
+                    except Exception:
+                        log.exception("Failed to update event message after RSVP")
+        except Exception:
+            log.exception("Error handling RSVP interaction")
+            try:
+                await interaction.response.send_message("Fehler beim Verarbeiten deines RSVP.", ephemeral=True)
+            except Exception:
+                pass
+
+# -------------------------
+# Reuse previous reminder + event posting handlers (kept minimal and balanced)
+# -------------------------
 async def reminder_coro(channel_id: int, discord_event_id: str, hours_before: int):
     ch = bot.get_channel(channel_id)
     if not ch:
@@ -111,9 +166,7 @@ async def reminder_coro(channel_id: int, discord_event_id: str, hours_before: in
         return
     embed = build_event_embed_from_db(discord_event_id)
     embed.title = f"📣 Event — startet in ~{hours_before} Stunden"
-    view = EventViewPlaceholder(discord_event_id)
-
-    # Try to delete previously posted tracked message (if any). Handle NotFound quietly and clear DB refs.
+    view = EventRSVPView(discord_event_id, None)
     tracked = db_execute("SELECT posted_channel_id, posted_message_id FROM tracked_events WHERE discord_event_id = ?", (discord_event_id,), fetch=True)
     if tracked:
         old_ch_id, old_msg_id = tracked[0]
@@ -124,7 +177,6 @@ async def reminder_coro(channel_id: int, discord_event_id: str, hours_before: in
                     try:
                         old_msg = await old_ch.fetch_message(old_msg_id)
                     except discord.NotFound:
-                        log.info("Old event message not found for %s; clearing DB posted refs.", discord_event_id)
                         db_execute("UPDATE tracked_events SET posted_channel_id = NULL, posted_message_id = NULL WHERE discord_event_id = ?", (discord_event_id,))
                         old_msg = None
                     except Exception:
@@ -134,13 +186,9 @@ async def reminder_coro(channel_id: int, discord_event_id: str, hours_before: in
                         try:
                             await old_msg.delete()
                         except discord.NotFound:
-                            log.info("Old event message disappeared before deletion for %s; ignoring.", discord_event_id)
+                            pass
                         except Exception:
                             log.exception("Failed deleting old event message during reminder for %s", discord_event_id)
-            except Exception:
-                log.exception("Failed while handling old event message during reminder for %s", discord_event_id)
-
-    # Send the reminder/post and persist new posted message id
     try:
         sent = await ch.send(embed=embed, view=view)
         db_execute("UPDATE tracked_events SET posted_channel_id = ?, posted_message_id = ?, updated_at = ? WHERE discord_event_id = ?",
@@ -148,9 +196,8 @@ async def reminder_coro(channel_id: int, discord_event_id: str, hours_before: in
     except Exception:
         log.exception("Failed sending reminder message for %s", discord_event_id)
 
-# Schedule or immediately run reminders for a given event start_time
+# scheduling helper (kept from prior step)
 def schedule_reminders_for_event(bot_inst, scheduler_inst, discord_event_id: str, start_time):
-    # remove existing jobs (best-effort)
     try:
         scheduler_inst.remove_job(f"event_reminder_24_{discord_event_id}")
     except Exception:
@@ -159,42 +206,29 @@ def schedule_reminders_for_event(bot_inst, scheduler_inst, discord_event_id: str
         scheduler_inst.remove_job(f"event_reminder_2_{discord_event_id}")
     except Exception:
         pass
-
     if not start_time:
         return
-
-    # ensure tz-aware
     if start_time.tzinfo is None:
         start_time = start_time.replace(tzinfo=timezone.utc)
-
     t24 = start_time - timedelta(hours=24)
     t2 = start_time - timedelta(hours=2)
     now = datetime.now(timezone.utc)
-
-    # schedule or fire for 24h
     if t24 > now:
         scheduler_inst.add_job(lambda: bot_inst.loop.create_task(reminder_coro(EVENTS_CHANNEL_ID, discord_event_id, 24)),
                                trigger=DateTrigger(run_date=t24), id=f"event_reminder_24_{discord_event_id}", replace_existing=True)
-        log.info("Scheduled 24h reminder for %s at %s", discord_event_id, t24.isoformat())
     elif t24 <= now < start_time:
         bot_inst.loop.create_task(reminder_coro(EVENTS_CHANNEL_ID, discord_event_id, 24))
-        log.info("Posted immediate 24h reminder for %s (start in <24h)", discord_event_id)
-
-    # schedule or fire for 2h
     if t2 > now:
         scheduler_inst.add_job(lambda: bot_inst.loop.create_task(reminder_coro(EVENTS_CHANNEL_ID, discord_event_id, 2)),
                                trigger=DateTrigger(run_date=t2), id=f"event_reminder_2_{discord_event_id}", replace_existing=True)
-        log.info("Scheduled 2h reminder for %s at %s", discord_event_id, t2.isoformat())
     elif t2 <= now < start_time:
         bot_inst.loop.create_task(reminder_coro(EVENTS_CHANNEL_ID, discord_event_id, 2))
-        log.info("Posted immediate 2h reminder for %s (start in <2h)", discord_event_id)
 
-# Expose bot_inst and scheduler_inst to lambdas used above
 bot_inst = bot
 scheduler_inst = scheduler
 
 # -------------------------
-# Event handlers (create/update/delete) - use schedule_reminders_for_event
+# Event handlers (create/update/delete) - update to use EventRSVPView
 # -------------------------
 @bot.event
 async def on_guild_scheduled_event_create(event: discord.ScheduledEvent):
@@ -207,12 +241,8 @@ async def on_guild_scheduled_event_create(event: discord.ScheduledEvent):
         start_iso = event.start_time.isoformat() if event.start_time else None
         guild_id = event.guild.id if getattr(event, "guild", None) else None
         now_iso = datetime.now(timezone.utc).isoformat()
-
-        # persist tracked_events row
         db_execute("INSERT OR REPLACE INTO tracked_events(guild_id, discord_event_id, start_time, updated_at) VALUES (?, ?, ?, ?)",
                    (guild_id, discord_event_id, start_iso, now_iso))
-
-        # check if a posted message is already recorded and exists
         tracked = db_execute("SELECT posted_channel_id, posted_message_id FROM tracked_events WHERE discord_event_id = ?", (discord_event_id,), fetch=True)
         if tracked:
             posted_ch_id, posted_msg_id = tracked[0]
@@ -223,7 +253,6 @@ async def on_guild_scheduled_event_create(event: discord.ScheduledEvent):
                         try:
                             _ = await ch_check.fetch_message(posted_msg_id)
                             log.info("Event %s already posted as message %s — skipping", discord_event_id, posted_msg_id)
-                            # schedule reminders based on event.start_time
                             try:
                                 schedule_reminders_for_event(bot_inst, scheduler_inst, discord_event_id, event.start_time)
                             except Exception:
@@ -238,20 +267,13 @@ async def on_guild_scheduled_event_create(event: discord.ScheduledEvent):
         if not ch:
             log.warning("Events channel %s not found", EVENTS_CHANNEL_ID)
             return
-        embed = discord.Embed(title=event.name or "Event", description=event.description or "", color=discord.Color.blue(), timestamp=datetime.now(timezone.utc))
-        if event.start_time:
-            try:
-                embed.add_field(name="Start", value=event.start_time.astimezone(ZoneInfo(POST_TIMEZONE)).strftime("%d.%m.%Y %H:%M %Z"), inline=False)
-            except Exception:
-                embed.add_field(name="Start", value=str(event.start_time), inline=False)
-        view = EventViewPlaceholder(discord_event_id)
+        embed = build_event_embed_from_db(discord_event_id, event.guild)
+        view = EventRSVPView(discord_event_id, event.guild)
         sent = await ch.send(embed=embed, view=view)
         db_execute("UPDATE tracked_events SET posted_channel_id = ?, posted_message_id = ?, updated_at = ? WHERE discord_event_id = ?",
                    (ch.id, sent.id, now_iso, discord_event_id))
-        # schedule reminders
         try:
-            start_dt = event.start_time
-            schedule_reminders_for_event(bot_inst, scheduler_inst, discord_event_id, start_dt)
+            schedule_reminders_for_event(bot_inst, scheduler_inst, discord_event_id, event.start_time)
         except Exception:
             log.exception("Failed scheduling reminders after post")
     except Exception:
@@ -268,13 +290,10 @@ async def on_guild_scheduled_event_update(event: discord.ScheduledEvent):
         start_iso = event.start_time.isoformat() if event.start_time else None
         now_iso = datetime.now(timezone.utc).isoformat()
         db_execute("UPDATE tracked_events SET start_time = ?, updated_at = ? WHERE discord_event_id = ?", (start_iso, now_iso, discord_event_id))
-        # reschedule reminders
         try:
-            start_dt = event.start_time
-            schedule_reminders_for_event(bot_inst, scheduler_inst, discord_event_id, start_dt)
+            schedule_reminders_for_event(bot_inst, scheduler_inst, discord_event_id, event.start_time)
         except Exception:
             log.exception("Failed to reschedule reminders (update)")
-        # update posted message embed if exists
         tracked = db_execute("SELECT posted_channel_id, posted_message_id FROM tracked_events WHERE discord_event_id = ?", (discord_event_id,), fetch=True)
         if tracked:
             ch_id, msg_id = tracked[0]
@@ -282,15 +301,9 @@ async def on_guild_scheduled_event_update(event: discord.ScheduledEvent):
             if ch and msg_id:
                 try:
                     msg = await ch.fetch_message(msg_id)
-                    embed = discord.Embed(title=event.name or "Event", description=event.description or "", color=discord.Color.blue(), timestamp=datetime.now(timezone.utc))
-                    if event.start_time:
-                        try:
-                            embed.add_field(name="Start", value=event.start_time.astimezone(ZoneInfo(POST_TIMEZONE)).strftime("%d.%m.%Y %H:%M %Z"), inline=False)
-                        except Exception:
-                            embed.add_field(name="Start", value=str(event.start_time), inline=False)
-                    await msg.edit(embed=embed, view=EventViewPlaceholder(discord_event_id))
+                    embed = build_event_embed_from_db(discord_event_id, event.guild)
+                    await msg.edit(embed=embed, view=EventRSVPView(discord_event_id, event.guild))
                 except discord.NotFound:
-                    log.info("Tracked event message missing during update for %s; clearing posted refs", discord_event_id)
                     db_execute("UPDATE tracked_events SET posted_channel_id = NULL, posted_message_id = NULL WHERE discord_event_id = ?", (discord_event_id,))
                 except Exception:
                     log.exception("Failed to update event message on event update")
@@ -324,6 +337,11 @@ async def on_guild_scheduled_event_delete(event: discord.ScheduledEvent):
 async def checkevents(ctx):
     rows = db_execute("SELECT discord_event_id, start_time, posted_channel_id, posted_message_id FROM tracked_events", fetch=True)
     await ctx.send(f"tracked_events: {rows}")
+
+@bot.command()
+async def rsvpstatus(ctx, discord_event_id: str):
+    rows = db_execute("SELECT user_id, status FROM event_rsvps WHERE discord_event_id = ?", (discord_event_id,), fetch=True) or []
+    await ctx.send(f"rsvps for {discord_event_id}: {rows}")
 
 @bot.command()
 async def ping(ctx):
