@@ -36,7 +36,7 @@ log = logging.getLogger("bot")
 intents = discord.Intents.default()
 intents.members = True
 intents.message_content = True
-intents.scheduled_events = True
+intents.guild_scheduled_events = True
 bot = commands.Bot(command_prefix="!", intents=intents)
 
 DB_PATH = os.getenv("POLL_DB", "polls.sqlite")
@@ -1224,4 +1224,5 @@ if __name__ == "__main__":
         raise SystemExit(1)
     init_db()
     bot.run(BOT_TOKEN)
+
 
