@@ -345,7 +345,7 @@ class SuggestModal(discord.ui.Modal, title="Neue Idee hinzufügen"):
         super().__init__()
         self.poll_id = poll_id
     async def on_submit(self, interaction: discord.Interaction):
-        text = str(self.idea.value).trim() if hasattr(self.idea.value, 'strip') else str(self.idea.value).strip()
+        text = str(self.idea.value).strip()
         if not text:
             await interaction.response.send_message("Leere Idee verworfen.", ephemeral=True)
             return
@@ -682,16 +682,30 @@ def schedule_reminders_for_event(bot, scheduler, discord_event_id: str, start_ti
 # -------------------------
 @bot.event
 async def on_guild_scheduled_event_create(event: discord.ScheduledEvent):
-    log.info(f"DEBUG: Received guild_scheduled_event_create id={getattr(event, 'id', None)} name={getattr(event, 'name', None)}")
+    log.info(
+        f"DEBUG: Received guild_scheduled_event_create id={getattr(event, 'id', None)} "
+        f"name={getattr(event, 'name', None)}"
+    )
     if not EVENTS_CHANNEL_ID:
         log.info("EVENTS_CHANNEL_ID not set; ignoring scheduled event create")
         return
+
     try:
         guild = event.guild
         discord_event_id = str(event.id)
         start_iso = event.start_time.isoformat() if event.start_time else None
-        db_execute("INSERT OR REPLACE INTO tracked_events(guild_id, discord_event_id, start_time, updated_at) VALUES (?, ?, ?, ?)", (guild.id if guild else None, discord_event_id, start_iso, datetime.now(timezone.utc).isoformat()))
-        tracked = db_execute("SELECT posted_channel_id, posted_message_id FROM tracked_events WHERE discord_event_id = ?", (discord_event_id,), fetch=True)
+
+        # ensure tracked row exists
+        db_execute(
+            "INSERT OR REPLACE INTO tracked_events(guild_id, discord_event_id, start_time, updated_at) VALUES (?, ?, ?, ?)",
+            (guild.id if guild else None, discord_event_id, start_iso, datetime.now(timezone.utc).isoformat())
+        )
+
+        # check if there's already a posted message recorded
+        tracked = db_execute(
+            "SELECT posted_channel_id, posted_message_id FROM tracked_events WHERE discord_event_id = ?",
+            (discord_event_id,), fetch=True
+        )
         if tracked:
             posted_ch_id, posted_msg_id = tracked[0]
             if posted_msg_id:
@@ -699,25 +713,45 @@ async def on_guild_scheduled_event_create(event: discord.ScheduledEvent):
                     ch_check = bot.get_channel(posted_ch_id) if posted_ch_id else None
                     if ch_check:
                         try:
+                            # verify message still exists
                             _ = await ch_check.fetch_message(posted_msg_id)
                             log.info("Event %s already has posted message %s — skipping post.", discord_event_id, posted_msg_id)
+                            # still (re)create reminders
                             try:
                                 schedule_reminders_for_event(bot, scheduler, discord_event_id, event.start_time, EVENTS_CHANNEL_ID)
                             except Exception:
                                 log.exception("Failed to schedule reminders for event")
                             return
                         except discord.NotFound:
-                            db_execute("UPDATE tracked_events SET posted_channel_id = NULL, posted_message_id = NULL WHERE discord_event_id = ?", (discord_event_id,))
+                            # message gone -> clear DB refs and continue to post
+                            db_execute(
+                                "UPDATE tracked_events SET posted_channel_id = NULL, posted_message_id = NULL WHERE discord_event_id = ?",
+                                (discord_event_id,)
+                            )
                         except Exception:
                             log.exception("Error checking existing posted message for event %s", discord_event_id)
+
+        # Post the event message
         ch = bot.get_channel(EVENTS_CHANNEL_ID)
         if ch:
-            embed = discord.Embed(title=event.name or "Event", description=event.description or "", color=discord.Color.blue(), timestamp=datetime.now(timezone.utc))
+            embed = discord.Embed(
+                title=event.name or "Event",
+                description=event.description or "",
+                color=discord.Color.blue(),
+                timestamp=datetime.now(timezone.utc)
+            )
             if event.start_time:
-                embed.add_field(name="Start", value=event.start_time.astimezone(ZoneInfo(POST_TIMEZONE)).strftime("%d.%m.%Y %H:%M %Z"), inline=False)
+                embed.add_field(
+                    name="Start",
+                    value=event.start_time.astimezone(ZoneInfo(POST_TIMEZONE)).strftime("%d.%m.%Y %H:%M %Z"),
+                    inline=False
+                )
             view = EventViewInFile(discord_event_id, guild)
             msg = await ch.send(embed=embed, view=view)
-            db_execute("UPDATE tracked_events SET posted_channel_id = ?, posted_message_id = ?, updated_at = ? WHERE discord_event_id = ?", (ch.id, msg.id, datetime.now(timezone.utc).isoformat(), discord_event_id))
+            db_execute(
+                "UPDATE tracked_events SET posted_channel_id = ?, posted_message_id = ?, updated_at = ? WHERE discord_event_id = ?",
+                (ch.id, msg.id, datetime.now(timezone.utc).isoformat(), discord_event_id)
+            )
             try:
                 schedule_reminders_for_event(bot, scheduler, discord_event_id, event.start_time, EVENTS_CHANNEL_ID)
             except Exception:
@@ -727,25 +761,39 @@ async def on_guild_scheduled_event_create(event: discord.ScheduledEvent):
     except Exception:
         log.exception("Error in on_guild_scheduled_event_create")
 
+
 @bot.event
 async def on_guild_scheduled_event_update(event: discord.ScheduledEvent):
-    log.info(f"DEBUG: Received guild_scheduled_event_update id={getattr(event, 'id', None)} name={getattr(event, 'name', None)}")
+    log.info(
+        f"DEBUG: Received guild_scheduled_event_update id={getattr(event, 'id', None)} "
+        f"name={getattr(event, 'name', None)}"
+    )
     if not EVENTS_CHANNEL_ID:
         log.info("EVENTS_CHANNEL_ID not set; ignoring scheduled event update")
         return
+
     try:
         discord_event_id = str(event.id)
         start_iso = event.start_time.isoformat() if event.start_time else None
-        db_execute("UPDATE tracked_events SET start_time = ?, updated_at = ? WHERE discord_event_id = ?", (start_iso, datetime.now(timezone.utc).isoformat(), discord_event_id))
+
+        db_execute(
+            "UPDATE tracked_events SET start_time = ?, updated_at = ? WHERE discord_event_id = ?",
+            (start_iso, datetime.now(timezone.utc).isoformat(), discord_event_id)
+        )
+
         try:
             schedule_reminders_for_event(bot, scheduler, discord_event_id, event.start_time, EVENTS_CHANNEL_ID)
         except Exception:
             log.exception("Failed to reschedule reminders for event update")
-        tracked = db_execute("SELECT posted_channel_id, posted_message_id FROM tracked_events WHERE discord_event_id = ?", (discord_event_id,), fetch=True)
+
+        tracked = db_execute(
+            "SELECT posted_channel_id, posted_message_id FROM tracked_events WHERE discord_event_id = ?",
+            (discord_event_id,), fetch=True
+        )
         if tracked:
             ch_id, msg_id = tracked[0]
-            ch = bot.get_channel(ch_id)
-            if ch:
+            ch = bot.get_channel(ch_id) if ch_id else None
+            if ch and msg_id:
                 try:
                     msg = await ch.fetch_message(msg_id)
                     embed = build_event_embed_from_db(discord_event_id, event.guild)
@@ -757,31 +805,6 @@ async def on_guild_scheduled_event_update(event: discord.ScheduledEvent):
                     log.exception("Failed to update event message on event update")
     except Exception:
         log.exception("Error in on_guild_scheduled_event_update")
-
-@bot.event
-async def on_guild_scheduled_event_delete(event: discord.ScheduledEvent):
-    log.info(f"DEBUG: Received guild_scheduled_event_delete id={getattr(event, 'id', None)}")
-    try:
-        discord_event_id = str(event.id)
-        tracked = db_execute("SELECT posted_channel_id, posted_message_id FROM tracked_events WHERE discord_event_id = ?", (discord_event_id,), fetch=True)
-        if tracked:
-            ch_id, msg_id = tracked[0]
-            try:
-                ch = bot.get_channel(ch_id)
-                if ch:
-                    try:
-                        msg = await ch.fetch_message(msg_id)
-                        await msg.delete()
-                    except discord.NotFound:
-                        log.info("Tracked event message already deleted for %s", discord_event_id)
-                    except Exception:
-                        log.exception("Failed to delete event message on event delete")
-            except Exception:
-                log.exception("Error while attempting to delete tracked message on event delete")
-        db_execute("DELETE FROM tracked_events WHERE discord_event_id = ?", (discord_event_id,))
-        db_execute("DELETE FROM event_rsvps WHERE discord_event_id = ?", (discord_event_id,))
-    except Exception:
-        log.exception("Error in on_guild_scheduled_event_delete")
 
 # -------------------------
 # Raw socket fallback logging and handler
@@ -963,183 +986,6 @@ async def pyver(ctx):
     import discord as _d
     ver = getattr(_d, "__version__", None) or getattr(_d, "version", "unknown")
     await ctx.send(f"discord.py version: {ver}")
-
-# -------------------------
-# Quarter poll implementation
-# -------------------------
-def build_quarter_embed(poll_id: int, guild: discord.Guild | None):
-    options = db_execute("SELECT id, title, description FROM quarter_options WHERE poll_id = ? ORDER BY id ASC", (poll_id,), fetch=True) or []
-    votes = db_execute("SELECT option_id, user_id FROM quarter_votes WHERE poll_id = ?", (poll_id,), fetch=True) or []
-    avail = db_execute("SELECT user_id, day FROM quarter_availability WHERE poll_id = ?", (poll_id,), fetch=True) or []
-    avail_map = {}
-    for uid, day in avail:
-        avail_map.setdefault(uid, set()).add(day)
-    votes_map = {}
-    for opt_id, uid in votes:
-        votes_map.setdefault(opt_id, []).append(uid)
-    embed = discord.Embed(title="🗓️ Quartals‑Planung (Long-term)", color=discord.Color.blurple(), timestamp=datetime.now(timezone.utc))
-    for opt_id, title, desc in options:
-        voters = votes_map.get(opt_id, [])
-        header = f"🗳️ {len(voters)} Stimmen"
-        value = header
-        if desc:
-            value += f"\n{desc}"
-        if voters:
-            day_map = {}
-            for uid in voters:
-                for d in avail_map.get(uid, set()):
-                    day_map.setdefault(d, []).append(uid)
-            common = [(d, ulist) for d, ulist in day_map.items() if len(ulist) >= 1]
-            if common:
-                max_count = max(len(ulist) for (_, ulist) in common)
-                best = [(d, ulist) for (d, ulist) in common if len(ulist) == max_count]
-                lines = []
-                for d, ulist in best:
-                    try:
-                        dd = datetime.fromisoformat(d).date()
-                        names = [user_display_name(guild, u) for u in ulist]
-                        lines.append(f"{dd.isoformat()}: {', '.join(names)}")
-                    except Exception:
-                        lines.append(f"{d}: {', '.join([str(uid) for uid in ulist])}")
-                value += "\n✅ Beliebteste Tage:\n" + "\n".join(lines)
-        embed.add_field(name=title, value=value or "(keine Beschreibung)", inline=False)
-    return embed
-
-class QuarterIdeaModal(discord.ui.Modal, title="Neue Quartals-Idee"):
-    title_input = discord.ui.TextInput(label="Titel", max_length=100)
-    desc = discord.ui.TextInput(label="Kurzbeschreibung", style=discord.TextStyle.long, required=False, max_length=500)
-    def __init__(self, poll_id: int):
-        super().__init__()
-        self.poll_id = poll_id
-    async def on_submit(self, interaction: discord.Interaction):
-        t = str(self.title_input.value).strip()
-        d = str(self.desc.value).strip()
-        db_execute("INSERT INTO quarter_options(poll_id, title, description, created_at, author_id) VALUES (?, ?, ?, ?, ?)", (self.poll_id, t, d, datetime.now(timezone.utc).isoformat(), interaction.user.id))
-        await interaction.response.send_message("✅ Idee hinzugefügt.", ephemeral=True)
-        try:
-            rows = db_execute("SELECT posted_channel_id, posted_message_id FROM quarter_polls WHERE id = ?", (self.poll_id,), fetch=True)
-            if rows:
-                ch_id, msg_id = rows[0]
-                ch = interaction.client.get_channel(ch_id)
-                if ch:
-                    msg = await ch.fetch_message(msg_id)
-                    if msg:
-                        embed = build_quarter_embed(self.poll_id, interaction.guild)
-                        view = build_quarter_view(self.poll_id)
-                        await msg.edit(embed=embed, view=view)
-        except Exception:
-            log.exception("Failed to update quarter poll message after new idea")
-
-class QuarterAddIdeaButton(discord.ui.Button):
-    def __init__(self, poll_id: int):
-        super().__init__(label="➕ Neue Idee (mit Beschreibung)", style=discord.ButtonStyle.secondary)
-        self.poll_id = poll_id
-    async def callback(self, interaction: discord.Interaction):
-        await interaction.response.send_modal(QuarterIdeaModal(self.poll_id))
-
-class QuarterVoteButton(discord.ui.Button):
-    def __init__(self, poll_id: int, option_id: int, title: str):
-        super().__init__(label=title[:80], style=discord.ButtonStyle.primary)
-        self.poll_id = poll_id
-        self.option_id = option_id
-    async def callback(self, interaction: discord.Interaction):
-        uid = interaction.user.id
-        rows = db_execute("SELECT 1 FROM quarter_votes WHERE poll_id = ? AND option_id = ? AND user_id = ?", (self.poll_id, self.option_id, uid), fetch=True)
-        if rows:
-            db_execute("DELETE FROM quarter_votes WHERE poll_id = ? AND option_id = ? AND user_id = ?", (self.poll_id, self.option_id, uid))
-            await interaction.response.send_message("Stimme entfernt.", ephemeral=True)
-        else:
-            db_execute("INSERT OR IGNORE INTO quarter_votes(poll_id, option_id, user_id) VALUES (?, ?, ?)", (self.poll_id, self.option_id, uid))
-            await interaction.response.send_message("Stimme gespeichert.", ephemeral=True)
-        try:
-            rows = db_execute("SELECT posted_channel_id, posted_message_id FROM quarter_polls WHERE id = ?", (self.poll_id,), fetch=True)
-            if rows:
-                ch_id, msg_id = rows[0]
-                ch = interaction.client.get_channel(ch_id)
-                if ch:
-                    msg = await ch.fetch_message(msg_id)
-                    if msg:
-                        embed = build_quarter_embed(self.poll_id, interaction.guild)
-                        view = build_quarter_view(self.poll_id)
-                        await msg.edit(embed=embed, view=view)
-        except Exception:
-            log.exception("Failed to update quarter poll after vote")
-
-class QuarterPickDaysModal(discord.ui.Modal, title="Tage auswählen (CSV)"):
-    dates = discord.ui.TextInput(label="Tage (z. B. 2026-01-05,2026-01-12)", style=discord.TextStyle.long)
-    def __init__(self, poll_id: int):
-        super().__init__()
-        self.poll_id = poll_id
-    async def on_submit(self, interaction: discord.Interaction):
-        raw = str(self.dates.value).strip()
-        parts = [p.strip() for p in raw.split(",") if p.strip()]
-        saved = 0
-        for p in parts:
-            try:
-                d = datetime.fromisoformat(p).date()
-                db_execute("INSERT OR IGNORE INTO quarter_availability(poll_id, user_id, day) VALUES (?, ?, ?)", (self.poll_id, interaction.user.id, d.isoformat()))
-                saved += 1
-            except Exception:
-                pass
-        await interaction.response.send_message(f"{saved} Tage gespeichert.", ephemeral=True)
-        try:
-            rows = db_execute("SELECT posted_channel_id, posted_message_id FROM quarter_polls WHERE id = ?", (self.poll_id,), fetch=True)
-            if rows:
-                ch_id, msg_id = rows[0]
-                ch = interaction.client.get_channel(ch_id)
-                if ch:
-                    msg = await ch.fetch_message(msg_id)
-                    if msg:
-                        embed = build_quarter_embed(self.poll_id, interaction.guild)
-                        view = build_quarter_view(self.poll_id)
-                        await msg.edit(embed=embed, view=view)
-        except Exception:
-            log.exception("Failed to update quarter poll after picking days")
-
-class QuarterPickDaysButton(discord.ui.Button):
-    def __init__(self, poll_id: int):
-        super().__init__(label="📅 Tage wählen (CSV YYYY-MM-DD)", style=discord.ButtonStyle.secondary)
-        self.poll_id = poll_id
-    async def callback(self, interaction: discord.Interaction):
-        await interaction.response.send_modal(QuarterPickDaysModal(self.poll_id))
-
-class QuarterView(discord.ui.View):
-    def __init__(self, poll_id: int):
-        super().__init__(timeout=None)
-        self.poll_id = poll_id
-        self.add_item(QuarterAddIdeaButton(poll_id))
-        self.add_item(QuarterPickDaysButton(poll_id))
-        options = db_execute("SELECT id, title FROM quarter_options WHERE poll_id = ? ORDER BY id ASC", (poll_id,), fetch=True) or []
-        for opt_id, title in options:
-            self.add_item(QuarterVoteButton(poll_id, opt_id, title))
-
-def build_quarter_view(poll_id: int):
-    return QuarterView(poll_id)
-
-def check_and_post_quarter_polls():
-    today = datetime.now(timezone.utc).date()
-    candidates = []
-    for year in [today.year, today.year + 1]:
-        for m in (1,4,7,10):
-            qstart = date(year, m, 1)
-            candidates.append(qstart)
-    for qstart in candidates:
-        post_date = qstart - timedelta(weeks=1)
-        if post_date == today:
-            existing = db_execute("SELECT id FROM quarter_polls WHERE quarter_start = ?", (qstart.isoformat(),), fetch=True)
-            if not existing:
-                created_at = datetime.now(timezone.utc).isoformat()
-                db_execute("INSERT INTO quarter_polls(quarter_start, created_at) VALUES (?, ?)", (qstart.isoformat(), created_at))
-                poll_id = db_execute("SELECT id FROM quarter_polls WHERE quarter_start = ? ORDER BY id DESC LIMIT 1", (qstart.isoformat(),), fetch=True)[0][0]
-                async def _post():
-                    ch = bot.get_channel(QUARTER_POLL_CHANNEL_ID)
-                    if not ch:
-                        return
-                    embed = build_quarter_embed(poll_id, None)
-                    view = build_quarter_view(poll_id)
-                    sent = await ch.send(embed=embed, view=view)
-                    db_execute("UPDATE quarter_polls SET posted_channel_id = ?, posted_message_id = ? WHERE id = ?", (ch.id, sent.id, poll_id))
-                bot.loop.create_task(_post())
 
 # -------------------------
 # Scheduler
