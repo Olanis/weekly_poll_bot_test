@@ -1,14 +1,18 @@
 #!/usr/bin/env python3
 """
-Full bot.py - v45 upgraded with v50 features + listevents command integrated.
+Full bot.py - v45 upgraded with v50 features + event-sync/fallback & debugging.
 
-This is your v45 codebase with:
+This file is your v45 codebase with the following additions:
 - Persistent component custom_ids and bot.add_view registration (from v50).
 - Async, rate-safe registration of PollView instances on startup.
-- Commands: !listpolls, !repairpoll, !recoverpollfrommessage (from v50).
+- Commands: !listpolls, !repairpoll, !recoverpollfrommessage, !listevents, !sync_events, !pyver.
 - Fixed datetime.now(... tz=...) usage where needed.
-- Added listevents command to list scheduled events in a guild (for debugging why on_guild_scheduled_event_create might not fire).
-No existing v45 functionality was removed — event and quarter-poll code remains intact.
+- on_socket_response raw dispatch logging and a fallback handler that will create/tr ack events
+  when a GUILD_SCHEDULED_EVENT_CREATE raw dispatch is observed (ensures new events are posted).
+- All original v45 functionality (events, quarter polls) kept intact.
+
+Replace your current bot.py with this file, restart the bot.
+Make sure environment variables are set: BOT_TOKEN, (optional) POLL_DB, CHANNEL_ID, EVENTS_CHANNEL_ID, QUARTER_POLL_CHANNEL_ID, POST_TIMEZONE.
 """
 import os
 import logging
@@ -36,30 +40,15 @@ log = logging.getLogger("bot")
 intents = discord.Intents.default()
 intents.members = True
 intents.message_content = True
+# ensure scheduled event gateway dispatches are enabled
 intents.guild_scheduled_events = True
+
 bot = commands.Bot(command_prefix="!", intents=intents)
-
-@bot.command()
-async def pyver(ctx):
-    import discord as _d
-    # discord.py stellt die Version in __version__ bereit
-    ver = getattr(_d, "__version__", None) or getattr(_d, "version", "unknown")
-    await ctx.send(f"discord.py version: {ver}")
-
-@bot.event
-async def on_socket_response(payload):
-    # payload is a dict; 't' is the event type (dispatch), 'd' is data
-    try:
-        t = payload.get("t")
-        if t and t.startswith("GUILD_SCHEDULED_EVENT"):
-            log.info(f"RAW DISPATCH: {t} payload keys: {list(payload.get('d',{}).keys())}")
-    except Exception:
-        log.exception("on_socket_response error")
 
 DB_PATH = os.getenv("POLL_DB", "polls.sqlite")
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 CHANNEL_ID = int(os.getenv("CHANNEL_ID", "0")) if os.getenv("CHANNEL_ID") else None
-POST_TIMEZONE = "Europe/Berlin"
+POST_TIMEZONE = os.getenv("POST_TIMEZONE", "Europe/Berlin")
 
 EVENTS_CHANNEL_ID = int(os.getenv("EVENTS_CHANNEL_ID", "0")) if os.getenv("EVENTS_CHANNEL_ID") else None
 QUARTER_POLL_CHANNEL_ID = int(os.getenv("QUARTER_POLL_CHANNEL_ID", "0")) if os.getenv("QUARTER_POLL_CHANNEL_ID") else None
@@ -115,7 +104,7 @@ def init_db():
     cur.execute("""
         CREATE TABLE IF NOT EXISTS tracked_events (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            guild_id INTEGER NOT NULL,
+            guild_id INTEGER,
             discord_event_id TEXT NOT NULL UNIQUE,
             posted_channel_id INTEGER,
             posted_message_id INTEGER,
@@ -244,7 +233,7 @@ def persist_availability(poll_id: str, user_id: int, slots: list):
         db_execute("INSERT OR IGNORE INTO availability(poll_id, user_id, slot) VALUES (?, ?, ?)", [(poll_id, user_id, s) for s in slots], many=True)
 
 def get_availability_for_poll(poll_id: str):
-    return db_execute("SELECT user_id, slot FROM availability WHERE poll_id = ?", (poll_id,), fetch=True) or []
+    return db_execute("SELECT user_id, slot FROM availability WHERE poll_id = ? ORDER BY user_id", (poll_id,), fetch=True) or []
 
 def get_options_since(poll_id: str, since_dt: datetime):
     rows = db_execute("SELECT option_text, created_at FROM options WHERE poll_id = ? AND created_at >= ? ORDER BY created_at ASC", (poll_id, since_dt.isoformat()), fetch=True)
@@ -336,6 +325,10 @@ def generate_poll_embed_from_db(poll_id: str, guild: discord.Guild | None = None
         embed.add_field(name=opt_text or "(ohne Titel)", value=value, inline=False)
 
     return embed
+
+def format_slot_range(slot: str) -> str:
+    day, hour = slot.split("-")
+    return slot_label_range(day, int(hour))
 
 # -------------------------
 # UI: Views, Buttons, Modals (with persistent custom_id where needed)
@@ -821,7 +814,7 @@ def schedule_reminders_for_event(bot, scheduler, discord_event_id: str, start_ti
     elif t2 <= now < start_time:
         bot.loop.create_task(reminder_coro(events_channel_id, discord_event_id, 2))
 
-# Event listeners with debug logging
+# Event listeners with debug logging (high-level handlers)
 @bot.event
 async def on_guild_scheduled_event_create(event: discord.ScheduledEvent):
     log.info(f"DEBUG: Received guild_scheduled_event_create id={getattr(event, 'id', None)} name={getattr(event, 'name', None)} guild_id={getattr(getattr(event, 'guild', None), 'id', None)}")
@@ -907,6 +900,73 @@ def reschedule_all_events():
             continue
         schedule_reminders_for_event(bot, scheduler, discord_event_id, start_dt, EVENTS_CHANNEL_ID)
 
+# Fallback: raw socket dispatch logging + fallback handler
+@bot.event
+async def on_socket_response(payload):
+    try:
+        t = payload.get("t")
+        if t and t.startswith("GUILD_SCHEDULED_EVENT"):
+            log.info(f"RAW DISPATCH: {t} payload keys: {list(payload.get('d',{}).keys())}")
+            # when create arrives, try fallback handling to post event immediately
+            if t == "GUILD_SCHEDULED_EVENT_CREATE":
+                d = payload.get("d", {})
+                bot.loop.create_task(_handle_scheduled_event_create_from_payload(d))
+    except Exception:
+        log.exception("on_socket_response error")
+
+async def _handle_scheduled_event_create_from_payload(d):
+    """
+    Fallback handler for raw GUILD_SCHEDULED_EVENT_CREATE payloads.
+    Attempts to create tracked_events row, post a message in EVENTS_CHANNEL_ID,
+    register reminders and persist posted message id.
+    """
+    try:
+        discord_event_id = str(d.get("id"))
+        name = d.get("name")
+        description = d.get("description")
+        # scheduled_start_time or scheduled_end_time depending on payload shape
+        start_raw = d.get("scheduled_start_time") or d.get("scheduled_start_time_iso") or d.get("start_time") or d.get("scheduled_start_time_raw")
+        start_dt = None
+        if start_raw:
+            try:
+                start_dt = datetime.fromisoformat(start_raw)
+            except Exception:
+                try:
+                    start_dt = datetime.fromisoformat(start_raw.replace("Z", "+00:00"))
+                except Exception:
+                    start_dt = None
+
+        # insert tracked_events if missing
+        existing = db_execute("SELECT 1 FROM tracked_events WHERE discord_event_id = ?", (discord_event_id,), fetch=True)
+        now_iso = datetime.now(timezone.utc).isoformat()
+        if not existing:
+            try:
+                db_execute("INSERT INTO tracked_events(guild_id, discord_event_id, start_time, updated_at) VALUES (?, ?, ?, ?)",
+                           (None, discord_event_id, start_dt.isoformat() if start_dt else None, now_iso))
+            except Exception:
+                db_execute("INSERT OR REPLACE INTO tracked_events(guild_id, discord_event_id, start_time, updated_at) VALUES (?, ?, ?, ?)",
+                           (None, discord_event_id, start_dt.isoformat() if start_dt else None, now_iso))
+
+        # post to EVENTS_CHANNEL_ID
+        ch = bot.get_channel(EVENTS_CHANNEL_ID) if EVENTS_CHANNEL_ID else None
+        if ch:
+            embed = discord.Embed(title=name or "Event", description=description or "", color=discord.Color.blue(), timestamp=datetime.now(timezone.utc))
+            if start_dt:
+                try:
+                    embed.add_field(name="Start", value=start_dt.astimezone(ZoneInfo("Europe/Berlin")).strftime("%d.%m.%Y %H:%M %Z"), inline=False)
+                except Exception:
+                    embed.add_field(name="Start", value=str(start_dt), inline=False)
+            view = EventViewInFile(discord_event_id, None)
+            sent = await ch.send(embed=embed, view=view)
+            db_execute("UPDATE tracked_events SET posted_channel_id = ?, posted_message_id = ?, updated_at = ? WHERE discord_event_id = ?",
+                       (ch.id, sent.id, datetime.now(timezone.utc).isoformat(), discord_event_id))
+            try:
+                schedule_reminders_for_event(bot, scheduler, discord_event_id, start_dt, EVENTS_CHANNEL_ID)
+            except Exception:
+                log.exception("Failed to schedule reminders in fallback handler")
+    except Exception:
+        log.exception("Fallback scheduled event create handler failed")
+
 # -------------------------
 # Debug command to inspect events table & channel
 # -------------------------
@@ -938,7 +998,6 @@ async def listevents(ctx):
             return
         lines = []
         for e in events:
-            # entity_type may be named differently; include relevant fields
             entity_type = getattr(e, "entity_type", None)
             channel_id = getattr(e, "channel_id", None)
             start_time = getattr(e, "start_time", None)
@@ -954,7 +1013,85 @@ async def listevents(ctx):
         await ctx.send(f"Fehler beim Abrufen der scheduled events: {exc}")
 
 # -------------------------
-# Quarter poll implementation (unchanged)
+# New command: sync_events (REST sync fallback)
+# -------------------------
+@bot.command()
+async def sync_events(ctx, post_channel_id: int = None):
+    """
+    Sync scheduled events from this guild: for each event visible via REST,
+    if not already in tracked_events, post a message to EVENTS_CHANNEL_ID (or post_channel_id if provided)
+    and insert it into tracked_events so reminders and RSVP UI work.
+    Usage:
+      !sync_events            -> uses ENV EVENTS_CHANNEL_ID
+      !sync_events 123456789  -> overrides channel to post into
+    """
+    guild = ctx.guild
+    if not guild:
+        await ctx.send("Dieses Kommando muss in einem Server (Guild) ausgeführt werden.")
+        return
+
+    target_channel_id = post_channel_id if post_channel_id else EVENTS_CHANNEL_ID
+    if not target_channel_id:
+        await ctx.send("Kein EVENTS_CHANNEL_ID gesetzt und kein channel_id als Parameter übergeben.")
+        return
+
+    ch = bot.get_channel(target_channel_id)
+    if not ch:
+        await ctx.send(f"Kanal {target_channel_id} nicht gefunden oder Bot hat keine Zugriffsrechte.")
+        return
+
+    try:
+        events = await guild.fetch_scheduled_events()
+    except Exception as e:
+        await ctx.send(f"Fehler beim Abrufen der scheduled events: {e}")
+        return
+
+    created = 0
+    for ev in events:
+        discord_event_id = str(ev.id)
+        existing = db_execute("SELECT 1 FROM tracked_events WHERE discord_event_id = ?", (discord_event_id,), fetch=True)
+        if existing:
+            continue
+
+        start_iso = None
+        try:
+            if getattr(ev, "start_time", None):
+                start_iso = ev.start_time.isoformat()
+        except Exception:
+            start_iso = None
+
+        now_iso = datetime.now(timezone.utc).isoformat()
+        try:
+            db_execute("INSERT INTO tracked_events(guild_id, discord_event_id, start_time, updated_at) VALUES (?, ?, ?, ?)",
+                       (guild.id if guild else None, discord_event_id, start_iso, now_iso))
+        except Exception:
+            db_execute("INSERT OR REPLACE INTO tracked_events(guild_id, discord_event_id, start_time, updated_at) VALUES (?, ?, ?, ?)",
+                       (guild.id if guild else None, discord_event_id, start_iso, now_iso))
+
+        try:
+            embed = discord.Embed(title=ev.name or "Event", description=ev.description or "", color=discord.Color.blue(), timestamp=datetime.now(timezone.utc))
+            if getattr(ev, "start_time", None):
+                try:
+                    embed.add_field(name="Start", value=ev.start_time.astimezone(ZoneInfo("Europe/Berlin")).strftime("%d.%m.%Y %H:%M %Z"), inline=False)
+                except Exception:
+                    embed.add_field(name="Start", value=str(ev.start_time), inline=False)
+            view = EventViewInFile(discord_event_id, guild)
+            sent = await ch.send(embed=embed, view=view)
+            db_execute("UPDATE tracked_events SET posted_channel_id = ?, posted_message_id = ?, updated_at = ? WHERE discord_event_id = ?",
+                       (ch.id, sent.id, datetime.now(timezone.utc).isoformat(), discord_event_id))
+            try:
+                start_dt = datetime.fromisoformat(start_iso) if start_iso else None
+                schedule_reminders_for_event(bot, scheduler, discord_event_id, start_dt, target_channel_id)
+            except Exception:
+                log.exception("Failed to schedule reminders during sync for event %s", discord_event_id)
+            created += 1
+        except Exception:
+            log.exception("Failed to post/track event %s during sync", discord_event_id)
+
+    await ctx.send(f"Sync abgeschlossen: {created} neue Events gepostet/registriert (wenn welche fehlten).")
+
+# -------------------------
+# Quarter poll implementation (unchanged except minor tz fixes)
 # -------------------------
 def build_quarter_embed(poll_id: int, guild: discord.Guild | None):
     options = db_execute("SELECT id, title, description FROM quarter_options WHERE poll_id = ? ORDER BY id ASC", (poll_id,), fetch=True) or []
@@ -1175,7 +1312,7 @@ async def job_post_weekly():
     log.info(f"Posted weekly poll {poll_id} to {channel} at {datetime.now(tz=ZoneInfo(POST_TIMEZONE))}")
 
 # -------------------------
-# Commands (updated)
+# Commands (startpoll/dailysummary already exist above)
 # -------------------------
 @bot.command()
 async def startpoll(ctx):
@@ -1186,6 +1323,15 @@ async def startpoll(ctx):
 async def dailysummary(ctx):
     await post_daily_summary_to(ctx.channel)
     await ctx.send("✅ Daily Summary gesendet (falls neue Inhalte vorhanden).", delete_after=6)
+
+# -------------------------
+# Additional helper commands
+# -------------------------
+@bot.command()
+async def pyver(ctx):
+    import discord as _d
+    ver = getattr(_d, "__version__", None) or getattr(_d, "version", "unknown")
+    await ctx.send(f"discord.py version: {ver}")
 
 # -------------------------
 # Persistent view registration (async, rate-safe)
@@ -1241,7 +1387,3 @@ if __name__ == "__main__":
         raise SystemExit(1)
     init_db()
     bot.run(BOT_TOKEN)
-
-
-
-
