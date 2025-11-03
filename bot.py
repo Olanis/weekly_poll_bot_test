@@ -3,11 +3,14 @@
 Weekly poll bot with persistent storage (SQLite) and weekly scheduling (Europe/Berlin).
 
 This version:
-- Reverts "📝 Idee hinzufügen" to the simple modal-only flow (no ephemeral AddOptionView).
-- Removes any UI or commands to delete user's own ideas (no delete buttons, no !deleteidea command).
-- Keeps voting (multi-vote), availability editor, weekly poll, and daily summary logic.
-- Daily summary only posts if there are new ideas since yesterday OR matches exist.
-- Uses timezone-aware UTC timestamps for DB records.
+- Adds a small red "✖️" delete button next to each idea in the PollView.
+  - The button is visible for everyone, but only the author (author_id stored in options)
+    can actually delete the idea. Others get an ephemeral error message.
+  - On successful deletion the bot removes the option and related votes from the DB
+    and tries to update the public poll message in the channel (best-effort).
+- Keeps the simple modal-only "📝 Idee hinzufügen" flow.
+- Keeps availability editor, multi-voting, daily summary behavior (only posts if new ideas or matches).
+- Uses timezone-aware timestamps for DB records.
 """
 import os
 import sqlite3
@@ -47,7 +50,7 @@ def init_db():
         )
         """
     )
-    # options (ideas) table (with created_at; keep author_id column if present but no deletion UI)
+    # options (ideas) table (with created_at and optional author_id)
     cur.execute(
         """
         CREATE TABLE IF NOT EXISTS options (
@@ -85,7 +88,7 @@ def init_db():
         )
         """
     )
-    # daily_summaries
+    # daily_summaries table
     cur.execute(
         """
         CREATE TABLE IF NOT EXISTS daily_summaries (
@@ -112,7 +115,7 @@ def db_execute(query, params=(), fetch=False, many=False):
     con.close()
     return rows
 
-# helpers for daily_summaries
+# daily_summaries helpers
 def get_last_daily_summary(channel_id: int):
     rows = db_execute("SELECT message_id FROM daily_summaries WHERE channel_id = ?", (channel_id,), fetch=True)
     return rows[0][0] if rows and rows[0][0] is not None else None
@@ -221,7 +224,6 @@ def generate_poll_embed_from_db(poll_id: str, guild: discord.Guild | None = None
         else:
             value = header + "\n👥 Keine Stimmen"
 
-        # compute matches and format similar to matches view
         if len(voters) >= 2:
             avail_rows = get_availability_for_poll(poll_id)
             slot_map = {}
@@ -270,7 +272,6 @@ class SuggestModal(discord.ui.Modal, title="Neue Idee hinzufügen"):
                 if msg.author == bot.user and msg.embeds:
                     em = msg.embeds[0]
                     if em.title and em.title.startswith("📋 Worauf"):
-                        # update embed
                         rows = db_execute("SELECT id FROM polls ORDER BY created_at DESC LIMIT 1", fetch=True)
                         if rows:
                             poll_id = rows[0][0]
@@ -308,6 +309,47 @@ class AddAvailabilityButton(discord.ui.Button):
             timestamp=datetime.now()
         )
         await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
+
+# New: DeleteOptionButton (small red ✖️)
+class DeleteOptionButton(discord.ui.Button):
+    def __init__(self, poll_id: str, option_id: int, option_text: str, author_id: int):
+        super().__init__(label="✖️", style=discord.ButtonStyle.danger)
+        self.poll_id = poll_id
+        self.option_id = option_id
+        self.option_text = option_text
+        self.author_id = author_id
+
+    async def callback(self, interaction: discord.Interaction):
+        # Only the author may delete
+        if interaction.user.id != self.author_id:
+            await interaction.response.send_message("❌ Nur der Autor kann diese Idee löschen.", ephemeral=True)
+            return
+
+        # Perform deletion: remove option and related votes
+        db_execute("DELETE FROM options WHERE id = ?", (self.option_id,))
+        db_execute("DELETE FROM votes WHERE option_id = ?", (self.option_id,))
+
+        await interaction.response.send_message(f"✅ Idee gelöscht: {self.option_text}", ephemeral=True)
+
+        # Best-effort: update the public poll message in this channel
+        try:
+            channel = interaction.channel
+            async for msg in channel.history(limit=200):
+                if msg.author == bot.user and msg.embeds:
+                    em = msg.embeds[0]
+                    if em.title and em.title.startswith("📋 Worauf"):
+                        rows = db_execute("SELECT id FROM polls ORDER BY created_at DESC LIMIT 1", fetch=True)
+                        if rows:
+                            poll_id = rows[0][0]
+                            new_embed = generate_poll_embed_from_db(poll_id, interaction.guild)
+                            new_view = PollView(poll_id)
+                            try:
+                                await msg.edit(embed=new_embed, view=new_view)
+                            except Exception:
+                                pass
+                        break
+        except Exception:
+            pass
 
 # Availability view/buttons (ephemeral)
 class DaySelectButton(discord.ui.Button):
@@ -385,7 +427,6 @@ class AvailabilityDayView(discord.ui.View):
         self.day_index = day_index
         self.for_user = for_user
 
-        # initialize temp selections from persisted values so the UI uses temp as single source of truth
         if for_user is not None:
             poll_tmp = temp_selections.setdefault(poll_id, {})
             if for_user not in poll_tmp:
@@ -431,8 +472,12 @@ class PollView(discord.ui.View):
         super().__init__(timeout=None)
         self.poll_id = poll_id
         options = get_options(poll_id)
-        for opt_id, opt_text, _created, _author in options:
+        # For each option add the vote button and a small delete button (delete visible to all but only works for author)
+        for opt_id, opt_text, _created, author_id in options:
+            # Add vote button
             self.add_item(PollButton(poll_id, opt_id, opt_text))
+            # Add the small delete button next to it
+            self.add_item(DeleteOptionButton(poll_id, opt_id, opt_text, author_id))
         self.add_item(AddOptionButton(poll_id))
         self.add_item(AddAvailabilityButton(poll_id))
 
@@ -627,8 +672,6 @@ async def dailysummary(ctx):
     """Manually post/update the daily summary in the current channel."""
     await post_daily_summary_to(ctx.channel)
     await ctx.send("✅ Daily Summary gesendet (falls neue Inhalte vorhanden).", delete_after=6)
-
-# Note: deleteidea command removed as requested (no user-facing deletion available now).
 
 # -------------------------
 # Bot events
