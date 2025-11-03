@@ -1,31 +1,28 @@
 #!/usr/bin/env python3
 """
-Full bot.py - v45 upgraded with v50 features + event-sync/fallback & robust duplicate-prevention.
+Full bot.py - corrected complete file.
 
-This file includes:
-- Persistent component custom_ids and bot.add_view registration.
-- Async, rate-safe registration of PollView instances on startup.
-- Commands: !listpolls, !repairpoll, !recoverpollfrommessage, !listevents, !sync_events, !pyver.
-- Fixed datetime.now(... tz=...) usage where needed.
-- on_socket_response raw dispatch logging and a fallback handler that will create/track events
-  when a GUILD_SCHEDULED_EVENT_CREATE raw dispatch is observed.
-- Duplicate-post prevention: before posting an event, the code checks tracked_events.posted_message_id
-  and verifies the message exists. If it exists, posting is skipped; if it doesn't exist, DB references
-  are cleared and reposting occurs.
-- Robust reminder deletion: NotFound (404) when fetching/deleting old messages is handled gracefully.
-- All original v45 functionality retained.
+This is the v45-based bot.py with:
+- v50 features merged (persistent custom_ids, bot.add_view registration, repair/recover/listpolls).
+- Event handling with REST sync command and raw-fallback handling.
+- Duplicate-post prevention and robust reminder deletion (handles 404 NotFound cleanly).
+- Debug commands: !listevents, !sync_events, !pyver, !checkevents.
+- Async registration of persistent Views at startup.
 
-Replace your current bot.py with this file, restart the bot.
+Replace your current bot.py with this file and restart the bot.
 Make sure environment variables are set: BOT_TOKEN, (optional) POLL_DB, CHANNEL_ID, EVENTS_CHANNEL_ID, QUARTER_POLL_CHANNEL_ID, POST_TIMEZONE.
 """
+from __future__ import annotations
+
 import os
-import logging
-import sqlite3
 import re
 import io
 import asyncio
+import sqlite3
 from datetime import datetime, timedelta, timezone, date
 from zoneinfo import ZoneInfo
+import logging
+
 import discord
 from discord.ext import commands
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
@@ -44,8 +41,7 @@ log = logging.getLogger("bot")
 intents = discord.Intents.default()
 intents.members = True
 intents.message_content = True
-# ensure scheduled event gateway dispatches are enabled
-intents.guild_scheduled_events = True
+intents.guild_scheduled_events = True  # required to receive scheduled event gateway dispatches
 
 bot = commands.Bot(command_prefix="!", intents=intents)
 
@@ -63,8 +59,6 @@ QUARTER_POLL_CHANNEL_ID = int(os.getenv("QUARTER_POLL_CHANNEL_ID", "0")) if os.g
 def init_db():
     con = sqlite3.connect(DB_PATH)
     cur = con.cursor()
-
-    # polls
     cur.execute("""
         CREATE TABLE IF NOT EXISTS polls (
             id TEXT PRIMARY KEY,
@@ -103,8 +97,6 @@ def init_db():
             created_at TEXT NOT NULL
         )
     """)
-
-    # events
     cur.execute("""
         CREATE TABLE IF NOT EXISTS tracked_events (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -124,8 +116,6 @@ def init_db():
             UNIQUE(discord_event_id, user_id)
         )
     """)
-
-    # quarter polls
     cur.execute("""
         CREATE TABLE IF NOT EXISTS quarter_polls (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -161,23 +151,24 @@ def init_db():
             UNIQUE(poll_id, user_id, day)
         )
     """)
-
     con.commit()
     con.close()
 
 def db_execute(query, params=(), fetch=False, many=False):
     con = sqlite3.connect(DB_PATH)
     cur = con.cursor()
-    if many:
-        cur.executemany(query, params)
-    else:
-        cur.execute(query, params)
-    rows = None
-    if fetch:
-        rows = cur.fetchall()
-    con.commit()
-    con.close()
-    return rows
+    try:
+        if many:
+            cur.executemany(query, params)
+        else:
+            cur.execute(query, params)
+        rows = None
+        if fetch:
+            rows = cur.fetchall()
+        con.commit()
+        return rows
+    finally:
+        con.close()
 
 # -------------------------
 # Utilities
@@ -206,27 +197,30 @@ def create_poll_record(poll_id: str):
 
 def add_option(poll_id: str, option_text: str, author_id: int = None):
     created_at = datetime.now(timezone.utc).isoformat()
-    db_execute("INSERT INTO options(poll_id, option_text, created_at, author_id) VALUES (?, ?, ?, ?)", (poll_id, option_text, created_at, author_id))
-    rows = db_execute("SELECT id FROM options WHERE poll_id = ? AND option_text = ? ORDER BY id DESC LIMIT 1", (poll_id, option_text), fetch=True)
+    db_execute("INSERT INTO options(poll_id, option_text, created_at, author_id) VALUES (?, ?, ?, ?)",
+               (poll_id, option_text, created_at, author_id))
+    rows = db_execute("SELECT id FROM options WHERE poll_id = ? AND option_text = ? ORDER BY id DESC LIMIT 1",
+                      (poll_id, option_text), fetch=True)
     return rows[-1][0] if rows else None
 
 def get_options(poll_id: str):
-    return db_execute("SELECT id, option_text, created_at, author_id FROM options WHERE poll_id = ? ORDER BY id ASC", (poll_id,), fetch=True) or []
+    return db_execute("SELECT id, option_text, created_at, author_id FROM options WHERE poll_id = ? ORDER BY id ASC",
+                      (poll_id,), fetch=True) or []
 
 def get_user_options(poll_id: str, user_id: int):
-    return db_execute("SELECT id, option_text, created_at FROM options WHERE poll_id = ? AND author_id = ? ORDER BY id ASC", (poll_id, user_id), fetch=True) or []
+    return db_execute("SELECT id, option_text, created_at FROM options WHERE poll_id = ? AND author_id = ? ORDER BY id ASC",
+                      (poll_id, user_id), fetch=True) or []
 
 def add_vote(poll_id: str, option_id: int, user_id: int):
     try:
-        db_execute("INSERT OR IGNORE INTO votes(poll_id, option_id, user_id) VALUES (?, ?, ?)", (poll_id, option_id, user_id))
+        db_execute("INSERT OR IGNORE INTO votes(poll_id, option_id, user_id) VALUES (?, ?, ?)",
+                   (poll_id, option_id, user_id))
     except Exception:
-        pass
+        log.exception("add_vote failed")
 
 def remove_vote(poll_id: str, option_id: int, user_id: int):
-    db_execute("DELETE FROM votes WHERE poll_id = ? AND option_id = ? AND user_id = ?", (poll_id, option_id, user_id))
-
-def remove_votes_for_user_poll(poll_id: str, user_id: int):
-    db_execute("DELETE FROM votes WHERE poll_id = ? AND user_id = ?", (poll_id, user_id))
+    db_execute("DELETE FROM votes WHERE poll_id = ? AND option_id = ? AND user_id = ?",
+               (poll_id, option_id, user_id))
 
 def get_votes_for_poll(poll_id: str):
     return db_execute("SELECT option_id, user_id FROM votes WHERE poll_id = ?", (poll_id,), fetch=True) or []
@@ -234,13 +228,15 @@ def get_votes_for_poll(poll_id: str):
 def persist_availability(poll_id: str, user_id: int, slots: list):
     db_execute("DELETE FROM availability WHERE poll_id = ? AND user_id = ?", (poll_id, user_id))
     if slots:
-        db_execute("INSERT OR IGNORE INTO availability(poll_id, user_id, slot) VALUES (?, ?, ?)", [(poll_id, user_id, s) for s in slots], many=True)
+        db_execute("INSERT OR IGNORE INTO availability(poll_id, user_id, slot) VALUES (?, ?, ?)",
+                   [(poll_id, user_id, s) for s in slots], many=True)
 
 def get_availability_for_poll(poll_id: str):
-    return db_execute("SELECT user_id, slot FROM availability WHERE poll_id = ? ORDER BY user_id", (poll_id,), fetch=True) or []
+    return db_execute("SELECT user_id, slot FROM availability WHERE poll_id = ?", (poll_id,), fetch=True) or []
 
 def get_options_since(poll_id: str, since_dt: datetime):
-    rows = db_execute("SELECT option_text, created_at FROM options WHERE poll_id = ? AND created_at >= ? ORDER BY created_at ASC", (poll_id, since_dt.isoformat()), fetch=True)
+    rows = db_execute("SELECT option_text, created_at FROM options WHERE poll_id = ? AND created_at >= ? ORDER BY created_at ASC",
+                      (poll_id, since_dt.isoformat()), fetch=True)
     return rows or []
 
 # -------------------------
@@ -281,19 +277,16 @@ def generate_poll_embed_from_db(poll_id: str, guild: discord.Guild | None = None
     votes_map = {}
     for opt_id, uid in votes:
         votes_map.setdefault(opt_id, []).append(uid)
-
     embed = discord.Embed(
         title="📋 Worauf hast du diese Woche Lust?",
-        description="Gib eigene Ideen ein, stimm ab oder trage deine Zeiten ein!",
+        description="Gib eigene Ideen ein, stimme ab oder trage deine Zeiten ein!",
         color=discord.Color.blurple(),
         timestamp=datetime.now(tz=ZoneInfo(POST_TIMEZONE))
     )
-
     for opt_id, opt_text, _created, author_id in options:
         voters = votes_map.get(opt_id, [])
         count = len(voters)
         header = f"🗳️ {count} Stimme" if count == 1 else f"🗳️ {count} Stimmen"
-
         if voters:
             names = [user_display_name(guild, uid) for uid in voters]
             if len(names) > 10:
@@ -305,8 +298,6 @@ def generate_poll_embed_from_db(poll_id: str, guild: discord.Guild | None = None
             value = header + "\n👥 " + names_line
         else:
             value = header + "\n👥 Keine Stimmen"
-
-        # compute matches and format: only show the slot(s) with the maximum number of users
         if len(voters) >= 2:
             avail_rows = get_availability_for_poll(poll_id)
             slot_map = {}
@@ -325,17 +316,11 @@ def generate_poll_embed_from_db(poll_id: str, guild: discord.Guild | None = None
                     names = [user_display_name(guild, u) for u in ulist]
                     lines.append(f"{timestr}: {', '.join(names)}")
                 value += "\n✅ Gemeinsame Zeit (beliebteste):\n" + "\n".join(lines)
-
         embed.add_field(name=opt_text or "(ohne Titel)", value=value, inline=False)
-
     return embed
 
-def format_slot_range(slot: str) -> str:
-    day, hour = slot.split("-")
-    return slot_label_range(day, int(hour))
-
 # -------------------------
-# UI: Views, Buttons, Modals (with persistent custom_id where needed)
+# UI: Views & Buttons
 # -------------------------
 class SuggestModal(discord.ui.Modal, title="Neue Idee hinzufügen"):
     idea = discord.ui.TextInput(label="Deine Idee", placeholder="z. B. Minecraft zocken", max_length=100)
@@ -358,20 +343,21 @@ class SuggestModal(discord.ui.Modal, title="Neue Idee hinzufügen"):
             if interaction.message:
                 await interaction.message.edit(embed=embed, view=new_view)
         except Exception:
-            log.exception("Failed to edit poll message after adding option")
+            log.exception("Failed to edit poll after adding option")
         await interaction.response.send_message("✅ Idee hinzugefügt.", ephemeral=True)
 
 class AddOptionButton(discord.ui.Button):
     def __init__(self, poll_id: str):
-        # persistent custom_id
-        super().__init__(label="📝 Idee hinzufügen", style=discord.ButtonStyle.secondary, custom_id=f"addopt:{poll_id}")
+        custom_id = f"addopt:{poll_id}"
+        super().__init__(label="📝 Idee hinzufügen", style=discord.ButtonStyle.secondary, custom_id=custom_id)
         self.poll_id = poll_id
     async def callback(self, interaction: discord.Interaction):
         await interaction.response.send_modal(SuggestModal(self.poll_id))
 
 class AddAvailabilityButton(discord.ui.Button):
     def __init__(self, poll_id: str):
-        super().__init__(label="🕓 Verfügbarkeit hinzufügen", style=discord.ButtonStyle.success, custom_id=f"avail:{poll_id}")
+        custom_id = f"avail:{poll_id}"
+        super().__init__(label="🕓 Verfügbarkeit hinzufügen", style=discord.ButtonStyle.success, custom_id=custom_id)
         self.poll_id = poll_id
     async def callback(self, interaction: discord.Interaction):
         view = AvailabilityDayView(self.poll_id, day_index=0, for_user=interaction.user.id)
@@ -383,10 +369,10 @@ class AddAvailabilityButton(discord.ui.Button):
         )
         await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
 
-# Icon-only gear button (persistent custom_id)
 class OpenEditOwnIdeasButton(discord.ui.Button):
     def __init__(self, poll_id: str):
-        super().__init__(label="⚙️", style=discord.ButtonStyle.secondary, custom_id=f"edit:{poll_id}")
+        custom_id = f"edit:{poll_id}"
+        super().__init__(label="⚙️", style=discord.ButtonStyle.secondary, custom_id=custom_id)
         self.poll_id = poll_id
     async def callback(self, interaction: discord.Interaction):
         user_id = interaction.user.id
@@ -411,13 +397,13 @@ class DeleteOwnOptionButtonEphemeral(discord.ui.Button):
         db_execute("DELETE FROM options WHERE id = ?", (self.option_id,))
         db_execute("DELETE FROM votes WHERE option_id = ?", (self.option_id,))
         await interaction.response.send_message(f"✅ Idee gelöscht: {self.option_text}", ephemeral=True)
-        # best-effort update public poll message in this channel
+        # best-effort update public poll message
         try:
             channel = interaction.channel
             async for msg in channel.history(limit=200):
                 if msg.author == bot.user and msg.embeds:
                     em = msg.embeds[0]
-                    if em.title and em.title.startswith("📋 Worauf"):
+                    if em.title and "Worauf" in em.title:
                         rows = db_execute("SELECT id FROM polls ORDER BY created_at DESC LIMIT 1", fetch=True)
                         if rows:
                             poll_id = rows[0][0]
@@ -427,10 +413,10 @@ class DeleteOwnOptionButtonEphemeral(discord.ui.Button):
                                 bot.add_view(new_view)
                                 await msg.edit(embed=new_embed, view=new_view)
                             except Exception:
-                                log.exception("Failed to update poll message after deleting option")
+                                log.exception("Failed to update public poll after delete")
                         break
         except Exception:
-            log.exception("Failed to search channel history to update poll message")
+            log.exception("Error while best-effort updating public message")
         try:
             refreshed = EditOwnIdeasView(self.poll_id, self.user_id)
             await interaction.followup.send("🔄 Aktualisierte Liste deiner Ideen:", view=refreshed, ephemeral=True)
@@ -458,7 +444,8 @@ class DaySelectButton(discord.ui.Button):
     def __init__(self, poll_id: str, day_index: int, selected: bool = False):
         label = f"{DAYS[day_index]}."
         style = discord.ButtonStyle.success if selected else discord.ButtonStyle.secondary
-        super().__init__(label=label, style=style, custom_id=f"day:{poll_id}:{day_index}")
+        custom_id = f"day:{poll_id}:{day_index}"
+        super().__init__(label=label, style=style, custom_id=custom_id)
         self.poll_id = poll_id
         self.day_index = day_index
     async def callback(self, interaction: discord.Interaction):
@@ -468,7 +455,8 @@ class DaySelectButton(discord.ui.Button):
 class HourButton(discord.ui.Button):
     def __init__(self, poll_id: str, day: str, hour: int):
         label = slot_label_range(day, hour)
-        super().__init__(label=label, style=discord.ButtonStyle.secondary, custom_id=f"hour:{poll_id}:{day}:{hour}")
+        custom_id = f"hour:{poll_id}:{day}:{hour}"
+        super().__init__(label=label, style=discord.ButtonStyle.secondary, custom_id=custom_id)
         self.poll_id = poll_id
         self.day = day
         self.hour = hour
@@ -487,7 +475,8 @@ class HourButton(discord.ui.Button):
 
 class SubmitButton(discord.ui.Button):
     def __init__(self, poll_id: str):
-        super().__init__(label="✅ Absenden", style=discord.ButtonStyle.success, custom_id=f"submit:{poll_id}")
+        custom_id = f"submit:{poll_id}"
+        super().__init__(label="✅ Absenden", style=discord.ButtonStyle.success, custom_id=custom_id)
         self.poll_id = poll_id
     async def callback(self, interaction: discord.Interaction):
         uid = interaction.user.id
@@ -505,7 +494,8 @@ class SubmitButton(discord.ui.Button):
 
 class RemovePersistedButton(discord.ui.Button):
     def __init__(self, poll_id: str):
-        super().__init__(label="🗑️ Gespeicherte Zeit löschen", style=discord.ButtonStyle.danger, custom_id=f"removepersist:{poll_id}")
+        custom_id = f"removepersist:{poll_id}"
+        super().__init__(label="🗑️ Gespeicherte Zeit löschen", style=discord.ButtonStyle.danger, custom_id=custom_id)
         self.poll_id = poll_id
     async def callback(self, interaction: discord.Interaction):
         uid = interaction.user.id
@@ -561,6 +551,7 @@ class AvailabilityDayView(discord.ui.View):
 # in-memory temporary selections
 temp_selections = {}
 
+# Persistent Poll View
 class PollView(discord.ui.View):
     def __init__(self, poll_id: str):
         super().__init__(timeout=None)
@@ -574,13 +565,14 @@ class PollView(discord.ui.View):
 
 class PollButton(discord.ui.Button):
     def __init__(self, poll_id: str, option_id: int, option_text: str):
-        # persistent custom_id so bot.add_view can register across restarts
-        super().__init__(label=option_text, style=discord.ButtonStyle.primary, custom_id=f"poll:{poll_id}:{option_id}")
+        custom_id = f"poll:{poll_id}:{option_id}"
+        super().__init__(label=option_text, style=discord.ButtonStyle.primary, custom_id=custom_id)
         self.poll_id = poll_id
         self.option_id = option_id
     async def callback(self, interaction: discord.Interaction):
         uid = interaction.user.id
-        rows = db_execute("SELECT 1 FROM votes WHERE poll_id = ? AND option_id = ? AND user_id = ?", (self.poll_id, self.option_id, uid), fetch=True)
+        rows = db_execute("SELECT 1 FROM votes WHERE poll_id = ? AND option_id = ? AND user_id = ?",
+                          (self.poll_id, self.option_id, uid), fetch=True)
         if rows:
             remove_vote(self.poll_id, self.option_id, uid)
         else:
@@ -594,10 +586,9 @@ class PollButton(discord.ui.Button):
         await interaction.response.edit_message(embed=embed, view=new_view)
 
 # -------------------------
-# Posting polls & daily summary
+# Posting polls
 # -------------------------
 async def post_poll_to_channel(channel: discord.abc.Messageable):
-    # use tz= to avoid TypeError
     poll_id = datetime.now(tz=ZoneInfo(POST_TIMEZONE)).strftime("%Y%m%dT%H%M%S")
     create_poll_record(poll_id)
     embed = generate_poll_embed_from_db(poll_id, channel.guild if isinstance(channel, discord.TextChannel) else None)
@@ -609,114 +600,134 @@ async def post_poll_to_channel(channel: discord.abc.Messageable):
     await channel.send(embed=embed, view=view)
     return poll_id
 
-# Wrapper for scheduler calls
-async def post_daily_summary():
-    await bot.wait_until_ready()
-    channel = None
-    if CHANNEL_ID:
-        channel = bot.get_channel(CHANNEL_ID)
-    if not channel:
-        for g in bot.guilds:
-            for ch in g.text_channels:
-                try:
-                    perms = ch.permissions_for(g.me)
-                    if perms.send_messages:
-                        channel = ch
-                        break
-                except Exception:
-                    continue
-            if channel:
-                break
-    if not channel:
-        log.info("Kein Kanal gefunden für Daily Summary.")
-        return
-    await post_daily_summary_to(channel)
+# -------------------------
+# Event helpers
+# -------------------------
+def _event_db_execute(query, params=(), fetch=False, many=False):
+    return db_execute(query, params, fetch=fetch, many=many)
 
-def get_last_daily_summary(channel_id: int):
-    rows = db_execute("SELECT message_id FROM daily_summaries WHERE channel_id = ?", (channel_id,), fetch=True)
-    return rows[0][0] if rows and rows[0][0] is not None else None
+class EventViewInFile(discord.ui.View):
+    def __init__(self, discord_event_id: str, guild: discord.Guild | None):
+        super().__init__(timeout=None)
+        self.discord_event_id = discord_event_id
+        self.guild = guild
 
-def set_last_daily_summary(channel_id: int, message_id: int):
-    now = datetime.now(timezone.utc).isoformat()
-    db_execute("INSERT OR REPLACE INTO daily_summaries(channel_id, message_id, created_at) VALUES (?, ?, ?)", (channel_id, message_id, now))
-
-async def post_daily_summary_to(channel: discord.TextChannel):
-    rows = db_execute("SELECT id, created_at FROM polls ORDER BY created_at DESC LIMIT 1", fetch=True)
-    if not rows:
-        return
-    poll_id, poll_created = rows[0]
-    tz = ZoneInfo(POST_TIMEZONE)
-    since = datetime.now(tz=tz) - timedelta(days=1)
-    new_options = get_options_since(poll_id, since)
-    matches = compute_matches_for_poll_from_db(poll_id)
-
-    if (not new_options) and (not matches):
-        return
-
-    embed = discord.Embed(title="🗓️ Tages-Update: Matches & neue Ideen", color=discord.Color.green(), timestamp=datetime.now(tz=tz))
-    if new_options:
-        lines = []
-        for opt_text, created_at in new_options:
-            try:
-                t = datetime.fromisoformat(created_at).astimezone(tz)
-                tstr = t.strftime("%d.%m. %H:%M")
-            except Exception:
-                tstr = created_at
-            lines.append(f"- {opt_text} (hinzugefügt {tstr})")
-        embed.add_field(name="🆕 Neue Ideen", value="\n".join(lines), inline=False)
-    else:
-        embed.add_field(name="🆕 Neue Ideen", value="Keine", inline=False)
-
-    if matches:
-        for opt_text, infos in matches.items():
-            lines = []
-            for info in infos:
-                slot = info["slot"]
-                day, hour_s = slot.split("-")
-                hour = int(hour_s)
-                timestr = slot_label_range(day, hour)
-                names = [user_display_name(channel.guild if isinstance(channel, discord.TextChannel) else None, u) for u in info["users"]]
-                lines.append(f"{timestr}: {', '.join(names)}")
-            embed.add_field(name=f"🤝 Matches — {opt_text}", value="\n".join(lines), inline=False)
-    else:
-        embed.add_field(name="🤝 Matches", value="Keine gemeinsamen Zeiten für Optionen mit ≥2 Stimmen.", inline=False)
-
-    voter_rows = db_execute("SELECT DISTINCT user_id FROM votes WHERE poll_id = ?", (poll_id,), fetch=True)
-    voters = [r[0] for r in voter_rows] if voter_rows else []
-    avail_rows = db_execute("SELECT DISTINCT user_id FROM availability WHERE poll_id = ?", (poll_id,), fetch=True)
-    has_avail = {r[0] for r in avail_rows} if avail_rows else set()
-    voters_no_avail = [uid for uid in voters if uid not in has_avail]
-    if voters_no_avail:
-        names = [user_display_name(channel.guild if isinstance(channel, discord.TextChannel) else None, uid) for uid in voters_no_avail]
-        if len(names) > 30:
-            shown = names[:30]
-            remaining = len(names) - 30
-            names_line = ", ".join(shown) + f", und {remaining} weitere..."
-        else:
-            names_line = ", ".join(names)
-        embed.add_field(name="ℹ️ Abstimmende ohne eingetragene Zeiten", value=names_line, inline=False)
-    else:
-        embed.add_field(name="ℹ️ Abstimmende ohne eingetragene Zeiten", value="Alle Abstimmenden haben Zeiten eingetragen.", inline=False)
-
-    last_msg_id = get_last_daily_summary(channel.id)
-    if last_msg_id:
+    @discord.ui.button(label="⚜️ Interessiert", style=discord.ButtonStyle.primary)
+    async def interested(self, interaction: discord.Interaction, button: discord.ui.Button):
+        user_id = interaction.user.id
         try:
-            prev = await channel.fetch_message(last_msg_id)
-            if prev:
-                await prev.delete()
-        except discord.NotFound:
-            pass
+            rows = _event_db_execute("SELECT status FROM event_rsvps WHERE discord_event_id = ? AND user_id = ?", (self.discord_event_id, user_id), fetch=True)
+            if rows and rows[0][0] == "interested":
+                _event_db_execute("DELETE FROM event_rsvps WHERE discord_event_id = ? AND user_id = ?", (self.discord_event_id, user_id))
+                await interaction.response.send_message("Deine Interesse wurde entfernt.", ephemeral=True)
+            else:
+                _event_db_execute("INSERT OR REPLACE INTO event_rsvps(discord_event_id, user_id, status) VALUES (?, ?, ?)", (self.discord_event_id, user_id, "interested"))
+                await interaction.response.send_message("Du bist als interessiert vermerkt.", ephemeral=True)
+            tracked = _event_db_execute("SELECT posted_channel_id, posted_message_id FROM tracked_events WHERE discord_event_id = ?", (self.discord_event_id,), fetch=True)
+            if tracked:
+                channel_id, message_id = tracked[0]
+                ch = interaction.client.get_channel(channel_id)
+                if ch:
+                    msg = await ch.fetch_message(message_id)
+                    if msg:
+                        embed = build_event_embed_from_db(self.discord_event_id, self.guild)
+                        await msg.edit(embed=embed, view=EventViewInFile(self.discord_event_id, self.guild))
         except Exception:
-            log.exception("Failed to delete previous daily summary")
-    sent = await channel.send(embed=embed)
-    try:
-        set_last_daily_summary(channel.id, sent.id)
-    except Exception:
-        log.exception("Failed to store daily summary message id")
+            log.exception("Error handling RSVP interaction")
 
-# -------------------------
-# Bot events & startup
-# -------------------------
+def build_event_embed_from_db(discord_event_id: str, guild: discord.Guild | None):
+    rows = _event_db_execute("SELECT discord_event_id, start_time FROM tracked_events WHERE discord_event_id = ?", (discord_event_id,), fetch=True)
+    start_time = rows[0][1] if rows else None
+    r = _event_db_execute("SELECT user_id FROM event_rsvps WHERE discord_event_id = ?", (discord_event_id,), fetch=True) or []
+    user_ids = [x[0] for x in r]
+    names = []
+    for uid in user_ids:
+        if guild:
+            m = guild.get_member(uid)
+            if m:
+                names.append(m.display_name)
+                continue
+        names.append(str(uid))
+    embed = discord.Embed(title="📣 Event", description="Details", color=discord.Color.blurple(), timestamp=datetime.now(timezone.utc))
+    if start_time:
+        try:
+            dt = datetime.fromisoformat(start_time)
+            embed.add_field(name="Start", value=dt.astimezone(ZoneInfo(POST_TIMEZONE)).strftime("%d.%m.%Y %H:%M %Z"), inline=False)
+        except Exception:
+            embed.add_field(name="Start", value=start_time, inline=False)
+    embed.add_field(name="Interessierte", value=", ".join(names) if names else "Keine", inline=False)
+    return embed
+
+def schedule_reminders_for_event(bot, scheduler, discord_event_id: str, start_time, events_channel_id):
+    try:
+        scheduler.remove_job(f"event_reminder_24_{discord_event_id}")
+    except Exception:
+        pass
+    try:
+        scheduler.remove_job(f"event_reminder_2_{discord_event_id}")
+    except Exception:
+        pass
+    if not start_time:
+        return
+    if start_time.tzinfo is None:
+        start_time = start_time.replace(tzinfo=ZoneInfo("UTC"))
+    t24 = start_time - timedelta(hours=24)
+    t2 = start_time - timedelta(hours=2)
+
+    async def reminder_coro(channel_id: int, discord_event_id: str, hours_before: int):
+        ch = bot.get_channel(channel_id)
+        if not ch:
+            log.info(f"reminder_coro: channel {channel_id} not found")
+            return
+        embed = build_event_embed_from_db(discord_event_id, None)
+        embed.title = f"📣 Event — startet in ~{hours_before} Stunden"
+        view = EventViewInFile(discord_event_id, None)
+
+        # Try to delete previous posted message if any; handle NotFound gracefully and clear DB refs
+        tracked = _event_db_execute("SELECT posted_channel_id, posted_message_id FROM tracked_events WHERE discord_event_id = ?", (discord_event_id,), fetch=True)
+        if tracked:
+            old_ch_id, old_msg_id = tracked[0]
+            if old_ch_id and old_msg_id:
+                try:
+                    old_ch = bot.get_channel(old_ch_id)
+                    if old_ch:
+                        try:
+                            old_msg = await old_ch.fetch_message(old_msg_id)
+                        except discord.NotFound:
+                            log.info("Old event message not found for %s; clearing DB posted refs.", discord_event_id)
+                            _event_db_execute("UPDATE tracked_events SET posted_channel_id = NULL, posted_message_id = NULL WHERE discord_event_id = ?", (discord_event_id,))
+                            old_msg = None
+                        except Exception:
+                            log.exception("Error fetching old event message during reminder for %s", discord_event_id)
+                            old_msg = None
+                        if old_msg:
+                            try:
+                                await old_msg.delete()
+                            except discord.NotFound:
+                                log.info("Old event message disappeared before deletion for %s; ignoring.", discord_event_id)
+                            except Exception:
+                                log.exception("Failed deleting old event message during reminder for %s", discord_event_id)
+                except Exception:
+                    log.exception("Failed while handling old event message during reminder for %s", discord_event_id)
+
+        try:
+            sent = await ch.send(embed=embed, view=view)
+            _event_db_execute("UPDATE tracked_events SET posted_channel_id = ?, posted_message_id = ?, updated_at = ? WHERE discord_event_id = ?",
+                              (ch.id, sent.id, datetime.now(timezone.utc).isoformat(), discord_event_id))
+        except Exception:
+            log.exception("Failed sending reminder message for %s", discord_event_id)
+
+    now = datetime.now(timezone.utc)
+    if t24 > now:
+        scheduler.add_job(lambda: bot.loop.create_task(reminder_coro(events_channel_id, discord_event_id, 24)), trigger=DateTrigger(run_date=t24), id=f"event_reminder_24_{discord_event_id}", replace_existing=True)
+    elif t24 <= now < start_time:
+        bot.loop.create_task(reminder_coro(events_channel_id, discord_event_id, 24))
+    if t2 > now:
+        scheduler.add_job(lambda: bot.loop.create_task(reminder_coro(events_channel_id, discord_event_id, 2)), trigger=DateTrigger(run_date=t2), id=f"event_reminder_2_{discord_event_id}", replace_existing=True)
+    elif t2 <= now < start_time:
+        bot.loop.create_task(reminder_coro(events_channel_id, discord_event_id, 2))
+
+# High-level scheduled event listeners
 @bot.event
 async def on_guild_scheduled_event_create(event: discord.ScheduledEvent):
     log.info(f"DEBUG: Received guild_scheduled_event_create id={getattr(event, 'id', None)} name={getattr(event, 'name', None)} guild_id={getattr(getattr(event, 'guild', None), 'id', None)}")
@@ -727,11 +738,9 @@ async def on_guild_scheduled_event_create(event: discord.ScheduledEvent):
         guild = event.guild
         discord_event_id = str(event.id)
         start_iso = event.start_time.isoformat() if event.start_time else None
-        # ensure tracked_events row exists
         db_execute("INSERT OR REPLACE INTO tracked_events(guild_id, discord_event_id, start_time, updated_at) VALUES (?, ?, ?, ?)",
                    (guild.id if guild else None, discord_event_id, start_iso, datetime.now(timezone.utc).isoformat()))
 
-        # check if we already have a posted message recorded and if it still exists
         tracked_row = db_execute("SELECT posted_channel_id, posted_message_id FROM tracked_events WHERE discord_event_id = ?", (discord_event_id,), fetch=True)
         if tracked_row:
             posted_channel_id, posted_message_id = tracked_row[0]
@@ -742,14 +751,12 @@ async def on_guild_scheduled_event_create(event: discord.ScheduledEvent):
                         try:
                             _ = await ch_check.fetch_message(posted_message_id)
                             log.info("Event %s already has posted message %s — skipping post.", discord_event_id, posted_message_id)
-                            # still schedule reminders
                             try:
                                 schedule_reminders_for_event(bot, scheduler, discord_event_id, event.start_time, EVENTS_CHANNEL_ID)
                             except Exception:
                                 log.exception("Failed to schedule reminders for event")
                             return
                         except discord.NotFound:
-                            # message gone -> clear DB reference and continue to post
                             db_execute("UPDATE tracked_events SET posted_channel_id = NULL, posted_message_id = NULL WHERE discord_event_id = ?", (discord_event_id,))
                         except Exception:
                             log.exception("Error checking existing posted message for event %s", discord_event_id)
@@ -828,23 +835,13 @@ async def on_guild_scheduled_event_delete(event: discord.ScheduledEvent):
     except Exception:
         log.exception("Error in on_guild_scheduled_event_delete")
 
-def reschedule_all_events():
-    rows = db_execute("SELECT discord_event_id, start_time FROM tracked_events", fetch=True) or []
-    for discord_event_id, start_iso in rows:
-        try:
-            start_dt = datetime.fromisoformat(start_iso)
-        except Exception:
-            continue
-        schedule_reminders_for_event(bot, scheduler, discord_event_id, start_dt, EVENTS_CHANNEL_ID)
-
-# Fallback: raw socket dispatch logging + fallback handler
+# Raw socket fallback handler
 @bot.event
 async def on_socket_response(payload):
     try:
         t = payload.get("t")
         if t and t.startswith("GUILD_SCHEDULED_EVENT"):
             log.info(f"RAW DISPATCH: {t} payload keys: {list(payload.get('d',{}).keys())}")
-            # when create arrives, try fallback handling to post event immediately
             if t == "GUILD_SCHEDULED_EVENT_CREATE":
                 d = payload.get("d", {})
                 bot.loop.create_task(_handle_scheduled_event_create_from_payload(d))
@@ -852,16 +849,11 @@ async def on_socket_response(payload):
         log.exception("on_socket_response error")
 
 async def _handle_scheduled_event_create_from_payload(d):
-    """
-    Fallback handler for raw GUILD_SCHEDULED_EVENT_CREATE payloads.
-    Attempts to create tracked_events row, check for existing posted messages and post if needed.
-    """
     try:
         discord_event_id = str(d.get("id"))
         name = d.get("name")
         description = d.get("description")
-        # payload uses scheduled_start_time in raw dispatch payloads usually
-        start_raw = d.get("scheduled_start_time") or d.get("start_time") or d.get("scheduled_start_time_iso") or d.get("scheduled_start_time_raw")
+        start_raw = d.get("scheduled_start_time") or d.get("start_time") or d.get("scheduled_start_time_iso")
         start_dt = None
         if start_raw:
             try:
@@ -872,7 +864,6 @@ async def _handle_scheduled_event_create_from_payload(d):
                 except Exception:
                     start_dt = None
 
-        # ensure tracked_events row exists
         existing = db_execute("SELECT posted_channel_id, posted_message_id FROM tracked_events WHERE discord_event_id = ?", (discord_event_id,), fetch=True)
         now_iso = datetime.now(timezone.utc).isoformat()
         if not existing:
@@ -896,7 +887,6 @@ async def _handle_scheduled_event_create_from_payload(d):
                             db_execute("UPDATE tracked_events SET posted_channel_id = NULL, posted_message_id = NULL WHERE discord_event_id = ?", (discord_event_id,))
                         except Exception:
                             log.exception("Fallback: error checking existing posted message for event %s", discord_event_id)
-
         ch = bot.get_channel(EVENTS_CHANNEL_ID) if EVENTS_CHANNEL_ID else None
         if ch:
             embed = discord.Embed(title=name or "Event", description=description or "", color=discord.Color.blue(), timestamp=datetime.now(timezone.utc))
@@ -916,9 +906,7 @@ async def _handle_scheduled_event_create_from_payload(d):
     except Exception:
         log.exception("Fallback scheduled event create handler failed")
 
-# -------------------------
-# Debug command to inspect events table & channel
-# -------------------------
+# Debug commands
 @bot.command()
 async def checkevents(ctx):
     await ctx.send(f"EVENTS_CHANNEL_ID={EVENTS_CHANNEL_ID}")
@@ -927,15 +915,8 @@ async def checkevents(ctx):
     rows = db_execute("SELECT discord_event_id, start_time, posted_channel_id, posted_message_id FROM tracked_events", fetch=True)
     await ctx.send(f"tracked_events rows: {rows}")
 
-# -------------------------
-# New debug command: listevents (lists scheduled events visible to the bot in this guild)
-# -------------------------
 @bot.command()
 async def listevents(ctx):
-    """
-    List scheduled events in this guild (for debugging).
-    Usage: !listevents
-    """
     guild = ctx.guild
     if not guild:
         await ctx.send("Kein Guild-Kontext (bitte im Server-Kanal ausführen).")
@@ -961,44 +942,28 @@ async def listevents(ctx):
         log.exception("Failed to fetch scheduled events")
         await ctx.send(f"Fehler beim Abrufen der scheduled events: {exc}")
 
-# -------------------------
-# New command: sync_events (REST sync fallback)
-# -------------------------
 @bot.command()
 async def sync_events(ctx, post_channel_id: int = None):
-    """
-    Sync scheduled events from this guild: for each event visible via REST,
-    if not already in tracked_events, post a message to EVENTS_CHANNEL_ID (or post_channel_id if provided)
-    and insert it into tracked_events so reminders and RSVP UI work.
-    Usage:
-      !sync_events            -> uses ENV EVENTS_CHANNEL_ID
-      !sync_events 123456789  -> overrides channel to post into
-    """
     guild = ctx.guild
     if not guild:
         await ctx.send("Dieses Kommando muss in einem Server (Guild) ausgeführt werden.")
         return
-
     target_channel_id = post_channel_id if post_channel_id else EVENTS_CHANNEL_ID
     if not target_channel_id:
         await ctx.send("Kein EVENTS_CHANNEL_ID gesetzt und kein channel_id als Parameter übergeben.")
         return
-
     ch = bot.get_channel(target_channel_id)
     if not ch:
         await ctx.send(f"Kanal {target_channel_id} nicht gefunden oder Bot hat keine Zugriffsrechte.")
         return
-
     try:
         events = await guild.fetch_scheduled_events()
     except Exception as e:
         await ctx.send(f"Fehler beim Abrufen der scheduled events: {e}")
         return
-
     created = 0
     for ev in events:
         discord_event_id = str(ev.id)
-        # fetch existing tracked row with posted message info
         existing = db_execute("SELECT posted_channel_id, posted_message_id FROM tracked_events WHERE discord_event_id = ?", (discord_event_id,), fetch=True)
         if existing:
             posted_ch_id, posted_msg_id = existing[0]
@@ -1008,30 +973,24 @@ async def sync_events(ctx, post_channel_id: int = None):
                     if ch_check:
                         try:
                             _ = await ch_check.fetch_message(posted_msg_id)
-                            # message exists -> skip
                             continue
                         except discord.NotFound:
                             db_execute("UPDATE tracked_events SET posted_channel_id = NULL, posted_message_id = NULL WHERE discord_event_id = ?", (discord_event_id,))
                         except Exception:
                             log.exception("Error checking existing posted message for event %s", discord_event_id)
-            # else: tracked but no posted message -> we'll post below
-
         start_iso = None
         try:
             if getattr(ev, "start_time", None):
                 start_iso = ev.start_time.isoformat()
         except Exception:
             start_iso = None
-
         now_iso = datetime.now(timezone.utc).isoformat()
         try:
-            # ensure tracked row
             db_execute("INSERT OR REPLACE INTO tracked_events(guild_id, discord_event_id, start_time, updated_at) VALUES (?, ?, ?, ?)",
                        (guild.id if guild else None, discord_event_id, start_iso, now_iso))
         except Exception:
             db_execute("INSERT OR REPLACE INTO tracked_events(guild_id, discord_event_id, start_time, updated_at) VALUES (?, ?, ?, ?)",
                        (guild.id if guild else None, discord_event_id, start_iso, now_iso))
-
         try:
             embed = discord.Embed(title=ev.name or "Event", description=ev.description or "", color=discord.Color.blue(), timestamp=datetime.now(timezone.utc))
             if getattr(ev, "start_time", None):
@@ -1051,62 +1010,7 @@ async def sync_events(ctx, post_channel_id: int = None):
             created += 1
         except Exception:
             log.exception("Failed to post/track event %s during sync", discord_event_id)
-
     await ctx.send(f"Sync abgeschlossen: {created} neue Events gepostet/registriert (wenn welche fehlten).")
-
-# -------------------------
-# Scheduler and startup
-# -------------------------
-scheduler = AsyncIOScheduler(timezone=ZoneInfo(POST_TIMEZONE))
-
-def schedule_weekly_post():
-    trigger = CronTrigger(day_of_week="sun", hour=12, minute=0, timezone=ZoneInfo(POST_TIMEZONE))
-    scheduler.add_job(job_post_weekly, trigger=trigger, id="weekly_poll", replace_existing=True)
-
-def schedule_daily_summary():
-    trigger_morning = CronTrigger(day_of_week="*", hour=9, minute=0, timezone=ZoneInfo(POST_TIMEZONE))
-    scheduler.add_job(post_daily_summary, trigger=trigger_morning, id="daily_summary_morning", replace_existing=True)
-    trigger_evening = CronTrigger(day_of_week="*", hour=18, minute=0, timezone=ZoneInfo(POST_TIMEZONE))
-    scheduler.add_job(post_daily_summary, trigger=trigger_evening, id="daily_summary_evening", replace_existing=True)
-
-def schedule_quarter_check():
-    scheduler.add_job(check_and_post_quarter_polls, CronTrigger(hour=8, minute=0, timezone=ZoneInfo("Europe/Berlin")), id="quarterly_check", replace_existing=True)
-
-async def job_post_weekly():
-    await bot.wait_until_ready()
-    channel = None
-    if CHANNEL_ID:
-        channel = bot.get_channel(CHANNEL_ID)
-    if not channel:
-        for g in bot.guilds:
-            for ch in g.text_channels:
-                try:
-                    perms = ch.permissions_for(g.me)
-                    if perms.send_messages:
-                        channel = ch
-                        break
-                except Exception:
-                    continue
-            if channel:
-                break
-    if not channel:
-        log.info("Kein Kanal gefunden: bitte CHANNEL_ID setzen oder verwenden Sie !startpoll in einem Kanal.")
-        return
-    poll_id = await post_poll_to_channel(channel)
-    log.info(f"Posted weekly poll {poll_id} to {channel} at {datetime.now(tz=ZoneInfo(POST_TIMEZONE))}")
-
-# -------------------------
-# Commands: startpoll/dailysummary already exist above
-# -------------------------
-@bot.command()
-async def startpoll(ctx):
-    poll_id = await post_poll_to_channel(ctx.channel)
-    await ctx.send(f"Poll gepostet (id via !listpolls)", delete_after=8)
-
-@bot.command()
-async def dailysummary(ctx):
-    await post_daily_summary_to(ctx.channel)
-    await ctx.send("✅ Daily Summary gesendet (falls neue Inhalte vorhanden).", delete_after=6)
 
 @bot.command()
 async def pyver(ctx):
@@ -1128,6 +1032,7 @@ async def register_persistent_poll_views_async(batch_delay: float = 0.02):
             log.exception("Failed to add persistent view for poll %s", poll_id)
         await asyncio.sleep(batch_delay)
 
+# Startup
 @bot.event
 async def on_ready():
     log.info(f"✅ Logged in as {bot.user} (ID: {bot.user.id})")
@@ -1146,17 +1051,13 @@ async def on_ready():
         log.info("EVENTS_CHANNEL_ID not set; event reminders will not be scheduled.")
     if not QUARTER_POLL_CHANNEL_ID:
         log.info("QUARTER_POLL_CHANNEL_ID not set; quarterly polls disabled.")
-
-    # register persistent views for existing polls asynchronously to avoid bursts
     try:
         bot.loop.create_task(register_persistent_poll_views_async(batch_delay=0.02))
         log.info("Scheduled async registration of PollView instances for existing polls.")
     except Exception:
         log.exception("Failed to schedule persistent view registration on startup.")
 
-# -------------------------
 # Entrypoint
-# -------------------------
 if __name__ == "__main__":
     if not BOT_TOKEN:
         print("Bitte BOT_TOKEN als Umgebungsvariable setzen.")
