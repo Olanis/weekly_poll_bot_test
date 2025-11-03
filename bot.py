@@ -39,6 +39,16 @@ intents.message_content = True
 intents.guild_scheduled_events = True
 bot = commands.Bot(command_prefix="!", intents=intents)
 
+@bot.event
+async def on_socket_response(payload):
+    # payload is a dict; 't' is the event type (dispatch), 'd' is data
+    try:
+        t = payload.get("t")
+        if t and t.startswith("GUILD_SCHEDULED_EVENT"):
+            log.info(f"RAW DISPATCH: {t} payload keys: {list(payload.get('d',{}).keys())}")
+    except Exception:
+        log.exception("on_socket_response error")
+
 DB_PATH = os.getenv("POLL_DB", "polls.sqlite")
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 CHANNEL_ID = int(os.getenv("CHANNEL_ID", "0")) if os.getenv("CHANNEL_ID") else None
@@ -1224,5 +1234,6 @@ if __name__ == "__main__":
         raise SystemExit(1)
     init_db()
     bot.run(BOT_TOKEN)
+
 
 
