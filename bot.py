@@ -1,15 +1,19 @@
 #!/usr/bin/env python3
 """
-Full bot.py - v45 upgraded with v50 features + event-sync/fallback & debugging.
+Full bot.py - v45 upgraded with v50 features + event-sync/fallback & robust duplicate-prevention.
 
-This file is your v45 codebase with the following additions:
-- Persistent component custom_ids and bot.add_view registration (from v50).
+This file includes:
+- Persistent component custom_ids and bot.add_view registration.
 - Async, rate-safe registration of PollView instances on startup.
 - Commands: !listpolls, !repairpoll, !recoverpollfrommessage, !listevents, !sync_events, !pyver.
 - Fixed datetime.now(... tz=...) usage where needed.
-- on_socket_response raw dispatch logging and a fallback handler that will create/tr ack events
-  when a GUILD_SCHEDULED_EVENT_CREATE raw dispatch is observed (ensures new events are posted).
-- All original v45 functionality (events, quarter polls) kept intact.
+- on_socket_response raw dispatch logging and a fallback handler that will create/track events
+  when a GUILD_SCHEDULED_EVENT_CREATE raw dispatch is observed.
+- Duplicate-post prevention: before posting an event, the code checks tracked_events.posted_message_id
+  and verifies the message exists. If it exists, posting is skipped; if it doesn't exist, DB references
+  are cleared and reposting occurs.
+- Robust reminder deletion: NotFound (404) when fetching/deleting old messages is handled gracefully.
+- All original v45 functionality retained.
 
 Replace your current bot.py with this file, restart the bot.
 Make sure environment variables are set: BOT_TOKEN, (optional) POLL_DB, CHANNEL_ID, EVENTS_CHANNEL_ID, QUARTER_POLL_CHANNEL_ID, POST_TIMEZONE.
@@ -795,15 +799,32 @@ def schedule_reminders_for_event(bot, scheduler, discord_event_id: str, start_ti
         if tracked:
             old_ch_id, old_msg_id = tracked[0]
             try:
-                old_ch = bot.get_channel(old_ch_id)
-                if old_ch:
-                    old_msg = await old_ch.fetch_message(old_msg_id)
+                old_ch = bot.get_channel(old_ch_id) if old_ch_id else None
+                if old_ch and old_msg_id:
+                    try:
+                        old_msg = await old_ch.fetch_message(old_msg_id)
+                    except discord.NotFound:
+                        # message already gone — clear DB reference
+                        log.info("Old event message not found (already deleted), clearing tracked reference.")
+                        _event_db_execute("UPDATE tracked_events SET posted_channel_id = NULL, posted_message_id = NULL WHERE discord_event_id = ?", (discord_event_id,))
+                        old_msg = None
+                    except Exception:
+                        log.exception("Error fetching old event message during reminder")
+                        old_msg = None
                     if old_msg:
-                        await old_msg.delete()
+                        try:
+                            await old_msg.delete()
+                        except discord.NotFound:
+                            log.info("Old event message disappeared before deletion; ignoring.")
+                        except Exception:
+                            log.exception("Failed deleting old event message during reminder")
             except Exception:
-                log.exception("Failed to delete old event message during reminder")
-        sent = await ch.send(embed=embed, view=view)
-        _event_db_execute("UPDATE tracked_events SET posted_channel_id = ?, posted_message_id = ?, updated_at = ? WHERE discord_event_id = ?", (ch.id, sent.id, datetime.now(timezone.utc).isoformat(), discord_event_id))
+                log.exception("Failed while handling old event message during reminder")
+        try:
+            sent = await ch.send(embed=embed, view=view)
+            _event_db_execute("UPDATE tracked_events SET posted_channel_id = ?, posted_message_id = ?, updated_at = ? WHERE discord_event_id = ?", (ch.id, sent.id, datetime.now(timezone.utc).isoformat(), discord_event_id))
+        except Exception:
+            log.exception("Failed sending reminder message")
     now = datetime.now(timezone.utc)
     if t24 > now:
         scheduler.add_job(lambda: bot.loop.create_task(reminder_coro(events_channel_id, discord_event_id, 24)), trigger=DateTrigger(run_date=t24), id=f"event_reminder_24_{discord_event_id}", replace_existing=True)
@@ -825,12 +846,37 @@ async def on_guild_scheduled_event_create(event: discord.ScheduledEvent):
         guild = event.guild
         discord_event_id = str(event.id)
         start_iso = event.start_time.isoformat() if event.start_time else None
+        # ensure tracked_events row exists
         db_execute("INSERT OR REPLACE INTO tracked_events(guild_id, discord_event_id, start_time, updated_at) VALUES (?, ?, ?, ?)", (guild.id if guild else None, discord_event_id, start_iso, datetime.now(timezone.utc).isoformat()))
+
+        # check if we already have a posted message recorded and if it still exists
+        tracked_row = db_execute("SELECT posted_channel_id, posted_message_id FROM tracked_events WHERE discord_event_id = ?", (discord_event_id,), fetch=True)
+        if tracked_row:
+            posted_channel_id, posted_message_id = tracked_row[0]
+            if posted_message_id:
+                try:
+                    ch_check = bot.get_channel(posted_channel_id) if posted_channel_id else None
+                    if ch_check:
+                        try:
+                            _ = await ch_check.fetch_message(posted_message_id)
+                            log.info("Event %s already has posted message %s — skipping post.", discord_event_id, posted_message_id)
+                            # still schedule reminders
+                            try:
+                                schedule_reminders_for_event(bot, scheduler, discord_event_id, event.start_time, EVENTS_CHANNEL_ID)
+                            except Exception:
+                                log.exception("Failed to schedule reminders for event")
+                            return
+                        except discord.NotFound:
+                            # message gone -> clear DB reference and continue to post
+                            db_execute("UPDATE tracked_events SET posted_channel_id = NULL, posted_message_id = NULL WHERE discord_event_id = ?", (discord_event_id,))
+                        except Exception:
+                            log.exception("Error checking existing posted message for event %s", discord_event_id)
+
         ch = bot.get_channel(EVENTS_CHANNEL_ID)
         if ch:
             embed = discord.Embed(title=event.name or "Event", description=event.description or "", color=discord.Color.blue(), timestamp=datetime.now(timezone.utc))
             if event.start_time:
-                embed.add_field(name="Start", value=event.start_time.astimezone(ZoneInfo("Europe/Berlin")).strftime("%d.%m.%Y %H:%M %Z"), inline=False)
+                embed.add_field(name="Start", value=event.start_time.astimezone(ZoneInfo(POST_TIMEZONE)).strftime("%d.%m.%Y %H:%M %Z"), inline=False)
             view = EventViewInFile(discord_event_id, guild)
             msg = await ch.send(embed=embed, view=view)
             db_execute("UPDATE tracked_events SET posted_channel_id = ?, posted_message_id = ?, updated_at = ? WHERE discord_event_id = ?", (ch.id, msg.id, datetime.now(timezone.utc).isoformat(), discord_event_id))
@@ -866,6 +912,9 @@ async def on_guild_scheduled_event_update(event: discord.ScheduledEvent):
                     msg = await ch.fetch_message(msg_id)
                     embed = build_event_embed_from_db(discord_event_id, event.guild)
                     await msg.edit(embed=embed, view=EventViewInFile(discord_event_id, event.guild))
+                except discord.NotFound:
+                    log.info("Tracked event message missing during update for %s; clearing posted reference.", discord_event_id)
+                    db_execute("UPDATE tracked_events SET posted_channel_id = NULL, posted_message_id = NULL WHERE discord_event_id = ?", (discord_event_id,))
                 except Exception:
                     log.exception("Failed to update event message on event update")
     except Exception:
@@ -882,10 +931,15 @@ async def on_guild_scheduled_event_delete(event: discord.ScheduledEvent):
             try:
                 ch = bot.get_channel(ch_id)
                 if ch:
-                    msg = await ch.fetch_message(msg_id)
-                    await msg.delete()
+                    try:
+                        msg = await ch.fetch_message(msg_id)
+                        await msg.delete()
+                    except discord.NotFound:
+                        log.info("Tracked event message already deleted for %s", discord_event_id)
+                    except Exception:
+                        log.exception("Failed to delete event message on event delete")
             except Exception:
-                log.exception("Failed to delete event message on event delete")
+                log.exception("Error while attempting to delete tracked message on event delete")
         db_execute("DELETE FROM tracked_events WHERE discord_event_id = ?", (discord_event_id,))
         db_execute("DELETE FROM event_rsvps WHERE discord_event_id = ?", (discord_event_id,))
     except Exception:
@@ -917,15 +971,14 @@ async def on_socket_response(payload):
 async def _handle_scheduled_event_create_from_payload(d):
     """
     Fallback handler for raw GUILD_SCHEDULED_EVENT_CREATE payloads.
-    Attempts to create tracked_events row, post a message in EVENTS_CHANNEL_ID,
-    register reminders and persist posted message id.
+    Attempts to create tracked_events row, check for existing posted messages and post if needed.
     """
     try:
         discord_event_id = str(d.get("id"))
         name = d.get("name")
         description = d.get("description")
-        # scheduled_start_time or scheduled_end_time depending on payload shape
-        start_raw = d.get("scheduled_start_time") or d.get("scheduled_start_time_iso") or d.get("start_time") or d.get("scheduled_start_time_raw")
+        # payload uses scheduled_start_time in raw dispatch payloads usually
+        start_raw = d.get("scheduled_start_time") or d.get("start_time") or d.get("scheduled_start_time_iso") or d.get("scheduled_start_time_raw")
         start_dt = None
         if start_raw:
             try:
@@ -936,8 +989,8 @@ async def _handle_scheduled_event_create_from_payload(d):
                 except Exception:
                     start_dt = None
 
-        # insert tracked_events if missing
-        existing = db_execute("SELECT 1 FROM tracked_events WHERE discord_event_id = ?", (discord_event_id,), fetch=True)
+        # ensure tracked_events row exists
+        existing = db_execute("SELECT posted_channel_id, posted_message_id FROM tracked_events WHERE discord_event_id = ?", (discord_event_id,), fetch=True)
         now_iso = datetime.now(timezone.utc).isoformat()
         if not existing:
             try:
@@ -946,20 +999,32 @@ async def _handle_scheduled_event_create_from_payload(d):
             except Exception:
                 db_execute("INSERT OR REPLACE INTO tracked_events(guild_id, discord_event_id, start_time, updated_at) VALUES (?, ?, ?, ?)",
                            (None, discord_event_id, start_dt.isoformat() if start_dt else None, now_iso))
+        else:
+            posted_ch_id, posted_msg_id = existing[0]
+            if posted_msg_id:
+                try:
+                    ch_check = bot.get_channel(posted_ch_id) if posted_ch_id else None
+                    if ch_check:
+                        try:
+                            _ = await ch_check.fetch_message(posted_msg_id)
+                            log.info("Fallback: Event %s already has posted message %s — skipping post.", discord_event_id, posted_msg_id)
+                            return
+                        except discord.NotFound:
+                            db_execute("UPDATE tracked_events SET posted_channel_id = NULL, posted_message_id = NULL WHERE discord_event_id = ?", (discord_event_id,))
+                        except Exception:
+                            log.exception("Fallback: error checking existing posted message for event %s", discord_event_id)
 
-        # post to EVENTS_CHANNEL_ID
         ch = bot.get_channel(EVENTS_CHANNEL_ID) if EVENTS_CHANNEL_ID else None
         if ch:
             embed = discord.Embed(title=name or "Event", description=description or "", color=discord.Color.blue(), timestamp=datetime.now(timezone.utc))
             if start_dt:
                 try:
-                    embed.add_field(name="Start", value=start_dt.astimezone(ZoneInfo("Europe/Berlin")).strftime("%d.%m.%Y %H:%M %Z"), inline=False)
+                    embed.add_field(name="Start", value=start_dt.astimezone(ZoneInfo(POST_TIMEZONE)).strftime("%d.%m.%Y %H:%M %Z"), inline=False)
                 except Exception:
                     embed.add_field(name="Start", value=str(start_dt), inline=False)
             view = EventViewInFile(discord_event_id, None)
             sent = await ch.send(embed=embed, view=view)
-            db_execute("UPDATE tracked_events SET posted_channel_id = ?, posted_message_id = ?, updated_at = ? WHERE discord_event_id = ?",
-                       (ch.id, sent.id, datetime.now(timezone.utc).isoformat(), discord_event_id))
+            db_execute("UPDATE tracked_events SET posted_channel_id = ?, posted_message_id = ?, updated_at = ? WHERE discord_event_id = ?", (ch.id, sent.id, datetime.now(timezone.utc).isoformat(), discord_event_id))
             try:
                 schedule_reminders_for_event(bot, scheduler, discord_event_id, start_dt, EVENTS_CHANNEL_ID)
             except Exception:
@@ -1049,9 +1114,23 @@ async def sync_events(ctx, post_channel_id: int = None):
     created = 0
     for ev in events:
         discord_event_id = str(ev.id)
-        existing = db_execute("SELECT 1 FROM tracked_events WHERE discord_event_id = ?", (discord_event_id,), fetch=True)
+        # fetch existing tracked row with posted message info
+        existing = db_execute("SELECT posted_channel_id, posted_message_id FROM tracked_events WHERE discord_event_id = ?", (discord_event_id,), fetch=True)
         if existing:
-            continue
+            posted_ch_id, posted_msg_id = existing[0]
+            if posted_msg_id:
+                try:
+                    ch_check = bot.get_channel(posted_ch_id) if posted_ch_id else None
+                    if ch_check:
+                        try:
+                            _ = await ch_check.fetch_message(posted_msg_id)
+                            # message exists -> skip
+                            continue
+                        except discord.NotFound:
+                            db_execute("UPDATE tracked_events SET posted_channel_id = NULL, posted_message_id = NULL WHERE discord_event_id = ?", (discord_event_id,))
+                        except Exception:
+                            log.exception("Error checking existing posted message for event %s", discord_event_id)
+            # else: tracked but no posted message -> we'll post below
 
         start_iso = None
         try:
@@ -1062,7 +1141,8 @@ async def sync_events(ctx, post_channel_id: int = None):
 
         now_iso = datetime.now(timezone.utc).isoformat()
         try:
-            db_execute("INSERT INTO tracked_events(guild_id, discord_event_id, start_time, updated_at) VALUES (?, ?, ?, ?)",
+            # ensure tracked row
+            db_execute("INSERT OR REPLACE INTO tracked_events(guild_id, discord_event_id, start_time, updated_at) VALUES (?, ?, ?, ?)",
                        (guild.id if guild else None, discord_event_id, start_iso, now_iso))
         except Exception:
             db_execute("INSERT OR REPLACE INTO tracked_events(guild_id, discord_event_id, start_time, updated_at) VALUES (?, ?, ?, ?)",
@@ -1072,7 +1152,7 @@ async def sync_events(ctx, post_channel_id: int = None):
             embed = discord.Embed(title=ev.name or "Event", description=ev.description or "", color=discord.Color.blue(), timestamp=datetime.now(timezone.utc))
             if getattr(ev, "start_time", None):
                 try:
-                    embed.add_field(name="Start", value=ev.start_time.astimezone(ZoneInfo("Europe/Berlin")).strftime("%d.%m.%Y %H:%M %Z"), inline=False)
+                    embed.add_field(name="Start", value=ev.start_time.astimezone(ZoneInfo(POST_TIMEZONE)).strftime("%d.%m.%Y %H:%M %Z"), inline=False)
                 except Exception:
                     embed.add_field(name="Start", value=str(ev.start_time), inline=False)
             view = EventViewInFile(discord_event_id, guild)
