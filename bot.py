@@ -281,15 +281,19 @@ class PollButton(discord.ui.Button):
         await interaction.response.edit_message(embed=embed, view=new_view)
 
 # New approach: AddOptionView (ephemeral) lists user's own ideas and allows delete, plus a button opening SuggestModal
-class AddOptionButton(discord.ui.Button):
+class AddAvailabilityButton(discord.ui.Button):
     def __init__(self, poll_id: str):
-        super().__init__(label="📝 Idee hinzufügen", style=discord.ButtonStyle.secondary)
+        super().__init__(label="🕓 Verfügbarkeit hinzufügen", style=discord.ButtonStyle.success)
         self.poll_id = poll_id
 
     async def callback(self, interaction: discord.Interaction):
-        # send ephemeral AddOptionView which shows user's own ideas and a button to open modal
-        view = AddOptionView(self.poll_id, interaction.user.id)
-        embed = discord.Embed(title="📝 Ideen verwalten", description="Füge neue Ideen hinzu oder lösche eigene Ideen. Nur du siehst diese Ansicht.", color=discord.Color.greyple(), timestamp=datetime.now())
+        view = AvailabilityDayView(self.poll_id, day_index=0, for_user=interaction.user.id)
+        embed = discord.Embed(
+            title="🕓 Verfügbarkeit auswählen",
+            description="Wähle Stunden für den angezeigten Tag (Mo.–So.). Nach Auswahl: Absenden.",
+            color=discord.Color.green(),
+            timestamp=datetime.now()
+        )
         await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
 
 # Button that opens the modal for submitting a new idea (only used inside AddOptionView)
@@ -744,3 +748,4 @@ if __name__ == "__main__":
         raise SystemExit(1)
     init_db()
     bot.run(BOT_TOKEN)
+
