@@ -1,20 +1,20 @@
 #!/usr/bin/env python3
 """
-Complete bot.py — full replacement, syntactically checked.
+bot.py — Events, Reminders, RSVP, Polls + Availability & Matching (complete file)
 
-Features:
-- Event handling: on_guild_scheduled_event_create/update/delete
-- Reminder scheduling (24h and 2h) with robust NotFound handling
-- RSVP UI with persistent view registration attempts and event_rsvps persistence
+Features in this version:
+- Event handling (create/update/delete) with tracked_events persistence
+- Reminders (24h, 2h) with robust NotFound handling
+- RSVP UI and event_rsvps persistence
 - Polls: polls/options/votes, !startpoll, AddIdea modal, voting buttons
+- Availability: availability table, "📆 Verfügbarkeit" modal from PollView, !matches command
 - Persistent view registration on startup
-- Debug commands: checkevents, rsvpstatus, listpolls, listoptions, pollresults, ping
+- Debug commands: checkevents, rsvpstatus, listpolls, listoptions, pollresults, matches, ping
 
 Environment variables:
 - BOT_TOKEN (required)
 - POLL_DB (optional; default polls.sqlite)
-- CHANNEL_ID (optional)
-- EVENTS_CHANNEL_ID (optional; channel to post events)
+- EVENTS_CHANNEL_ID (optional)
 - POST_TIMEZONE (optional; default Europe/Berlin)
 """
 from __future__ import annotations
@@ -25,6 +25,7 @@ import logging
 import asyncio
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
+import re
 
 import discord
 from discord.ext import commands
@@ -46,7 +47,6 @@ bot = commands.Bot(command_prefix="!", intents=intents)
 
 DB_PATH = os.getenv("POLL_DB", "polls.sqlite")
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-CHANNEL_ID = int(os.getenv("CHANNEL_ID", "0")) if os.getenv("CHANNEL_ID") else None
 EVENTS_CHANNEL_ID = int(os.getenv("EVENTS_CHANNEL_ID", "0")) if os.getenv("EVENTS_CHANNEL_ID") else None
 POST_TIMEZONE = os.getenv("POST_TIMEZONE", "Europe/Berlin")
 
@@ -80,7 +80,9 @@ def init_db():
     cur.execute("""
         CREATE TABLE IF NOT EXISTS polls (
             id TEXT PRIMARY KEY,
-            created_at TEXT NOT NULL
+            created_at TEXT NOT NULL,
+            posted_channel_id INTEGER,
+            posted_message_id INTEGER
         )
     """)
     cur.execute("""
@@ -98,6 +100,16 @@ def init_db():
             option_id INTEGER NOT NULL,
             user_id INTEGER NOT NULL,
             UNIQUE(poll_id, option_id, user_id)
+        )
+    """)
+    # availability table: one row per poll,user,day,hour
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS availability (
+            poll_id TEXT NOT NULL,
+            user_id INTEGER NOT NULL,
+            day TEXT NOT NULL,
+            hour INTEGER NOT NULL,
+            UNIQUE(poll_id, user_id, day, hour)
         )
     """)
     con.commit()
@@ -127,6 +139,8 @@ scheduler_inst = scheduler
 # -------------------------
 # Utilities
 # -------------------------
+DAY_NAMES = ["Mo", "Di", "Mi", "Do", "Fr", "Sa", "So"]
+
 def get_user_display(guild: discord.Guild | None, user_id: int) -> str:
     if guild:
         m = guild.get_member(user_id)
@@ -134,6 +148,54 @@ def get_user_display(guild: discord.Guild | None, user_id: int) -> str:
             return m.display_name
     u = bot.get_user(user_id)
     return getattr(u, "name", str(user_id))
+
+# parse slot inputs like "Mo18,Di19" or "Mo-18" or "Mo 18"
+_slot_re = re.compile(r"^(?P<day>[A-Za-zÄÖÜäöü]{2,3})\s*[-]?\s*(?P<hour>\d{1,2})$")
+
+def parse_slots_text(text: str) -> list[tuple[str,int]]:
+    """
+    Parse text like "Mo18, Di19, Fr20" into list of (day_short, hour)
+    Accepts day names in German two-letter like Mo,Di,... or full (Montag).
+    Hours must be 0-23; invalid entries are ignored.
+    """
+    res = []
+    parts = re.split(r"[,\n;]+", text)
+    for p in parts:
+        p = p.strip()
+        if not p:
+            continue
+        # try matching e.g., "Mo18" or "Mo-18" or "Mo 18"
+        m = _slot_re.match(p)
+        if m:
+            day = m.group("day")[:2].capitalize()
+            try:
+                hour = int(m.group("hour"))
+            except Exception:
+                continue
+            if hour < 0 or hour > 23:
+                continue
+            # normalize day token to Mo/Di/... if possible
+            lookup = {"Mo":"Mo","Di":"Di","Mi":"Mi","Do":"Do","Fr":"Fr","Sa":"Sa","So":"So",
+                      "Montag":"Mo","Montag":"Mo","Dienstag":"Di","Mittwoch":"Mi","Donnerstag":"Do",
+                      "Freitag":"Fr","Samstag":"Sa","Sonntag":"So"}
+            day_norm = lookup.get(day, day)
+            if day_norm in DAY_NAMES:
+                res.append((day_norm, hour))
+            else:
+                # try first two letters
+                day2 = day[:2]
+                if day2 in DAY_NAMES:
+                    res.append((day2, hour))
+        else:
+            # attempt more permissive parse: letters then digits
+            m2 = re.match(r"^([A-Za-zÄÖÜäöü]+)\s*(\d{1,2})$", p)
+            if m2:
+                day = m2.group(1)[:2].capitalize()
+                hour = int(m2.group(2))
+                if 0 <= hour <= 23:
+                    if day in DAY_NAMES:
+                        res.append((day, hour))
+    return res
 
 # -------------------------
 # Event embed / RSVP helpers
@@ -166,7 +228,7 @@ def build_event_embed_from_db(discord_event_id: str, guild: discord.Guild | None
     return embed
 
 # -------------------------
-# EventRSVP View
+# RSVP View
 # -------------------------
 class EventRSVPView(discord.ui.View):
     def __init__(self, discord_event_id: str, guild: discord.Guild | None):
@@ -476,7 +538,7 @@ async def on_guild_scheduled_event_delete(event: discord.ScheduledEvent):
         log.exception("Error in on_guild_scheduled_event_delete")
 
 # -------------------------
-# Polls: AddIdea modal, voting, views
+# Polls: AddIdea modal, voting, availability, views
 # -------------------------
 class SuggestIdeaModal(discord.ui.Modal, title="Neue Idee hinzufügen"):
     idea = discord.ui.TextInput(label="Deine Idee", placeholder="z. B. Minecraft zocken", max_length=200)
@@ -521,6 +583,55 @@ class AddIdeaButton(discord.ui.Button):
     async def callback(self, interaction: discord.Interaction):
         await interaction.response.send_modal(SuggestIdeaModal(self.poll_id))
 
+# Availability modal: user inputs slots like "Mo18,Di19"
+class AvailabilityModal(discord.ui.Modal, title="Verfügbarkeit eintragen (z. B. Mo18, Di19)"):
+    slots = discord.ui.TextInput(label="Slots", placeholder="Mo18, Di19, Fr20", style=discord.TextStyle.long, max_length=400)
+    def __init__(self, poll_id: str):
+        super().__init__()
+        self.poll_id = poll_id
+
+    async def on_submit(self, interaction: discord.Interaction):
+        text = str(self.slots.value).strip()
+        slots = parse_slots_text(text)
+        if not slots:
+            await interaction.response.send_message("Keine gültigen Slots erkannt. Benutze z.B. 'Mo18,Di19'.", ephemeral=True)
+            return
+        uid = interaction.user.id
+        poll_id = self.poll_id
+        try:
+            # Remove existing availability for this user & poll, then insert new
+            db_execute("DELETE FROM availability WHERE poll_id = ? AND user_id = ?", (poll_id, uid))
+            to_insert = [(poll_id, uid, day, hour) for (day, hour) in slots]
+            db_execute("INSERT OR REPLACE INTO availability(poll_id, user_id, day, hour) VALUES (?, ?, ?, ?)", to_insert, many=True)
+            await interaction.response.send_message(f"Verfügbarkeit gespeichert: {len(slots)} Slots.", ephemeral=True)
+            # Try to update poll message in channel (best-effort)
+            try:
+                if interaction.message:
+                    async for msg in interaction.channel.history(limit=200):
+                        if msg.author == bot.user and msg.embeds:
+                            em = msg.embeds[0]
+                            if em.title and "Worauf" in em.title:
+                                embed = generate_poll_embed_from_db(poll_id, interaction.guild)
+                                try:
+                                    bot.add_view(PollView(poll_id))
+                                except Exception:
+                                    pass
+                                await msg.edit(embed=embed, view=PollView(poll_id))
+                                break
+            except Exception:
+                log.exception("Best-effort poll message update after availability failed")
+        except Exception:
+            log.exception("Failed storing availability")
+            await interaction.response.send_message("Fehler beim Speichern deiner Verfügbarkeit.", ephemeral=True)
+
+class AvailabilityButton(discord.ui.Button):
+    def __init__(self, poll_id: str):
+        super().__init__(label="📆 Verfügbarkeit", style=discord.ButtonStyle.primary, custom_id=f"poll:availability:{poll_id}")
+        self.poll_id = poll_id
+    async def callback(self, interaction: discord.Interaction):
+        await interaction.response.send_modal(AvailabilityModal(self.poll_id))
+
+# Votes helpers
 def add_vote_to_db(poll_id: str, option_id: int, user_id: int):
     try:
         db_execute("INSERT OR IGNORE INTO votes(poll_id, option_id, user_id) VALUES (?, ?, ?)",
@@ -541,6 +652,16 @@ def get_votes_map_for_poll(poll_id: str) -> dict[int, list[int]]:
         ret.setdefault(opt_id, []).append(uid)
     return ret
 
+# compute matches for a poll: returns dict slot -> set(user_ids)
+def compute_slot_participants_for_poll(poll_id: str) -> dict[tuple[str,int], set]:
+    rows = db_execute("SELECT day, hour, user_id FROM availability WHERE poll_id = ?", (poll_id,), fetch=True) or []
+    slot_map: dict[tuple[str,int], set] = {}
+    for day, hour, uid in rows:
+        key = (day, hour)
+        slot_map.setdefault(key, set()).add(uid)
+    return slot_map
+
+# Generate poll embed including top slots summary (based on availability)
 def generate_poll_embed_from_db(poll_id: str, guild: discord.Guild | None = None) -> discord.Embed:
     options = db_execute("SELECT id, option_text, created_at, author_id FROM options WHERE poll_id = ? ORDER BY id ASC", (poll_id,), fetch=True) or []
     votes_map = get_votes_map_for_poll(poll_id)
@@ -550,26 +671,44 @@ def generate_poll_embed_from_db(poll_id: str, guild: discord.Guild | None = None
         color=discord.Color.blurple(),
         timestamp=datetime.now(timezone.utc)
     )
+    # availability summary
+    slot_map = compute_slot_participants_for_poll(poll_id)
+    if slot_map:
+        # rank by number of participants
+        ranked = sorted(slot_map.items(), key=lambda kv: len(kv[1]), reverse=True)
+        topn = ranked[:3]
+        lines = []
+        for (day,hour), users in topn:
+            names = [get_user_display(guild, uid) for uid in list(users)[:6]]
+            more = len(users) - len(names)
+            names_str = ", ".join(names) + (f", und {more} weitere" if more>0 else "")
+            lines.append(f"{day} {hour:02d}:00 — {len(users)} Personen ({names_str})")
+        embed.add_field(name="📆 Top gemeinsame Slots", value="\n".join(lines), inline=False)
+    # options + votes
     if not options:
         embed.add_field(name="ℹ️ Keine Ideen", value="Sei der Erste und füge eine Idee hinzu!", inline=False)
     else:
         for opt_id, opt_text, created_at, author_id in options:
             voters = votes_map.get(opt_id, [])
             count = len(voters)
+            # compute how many voters of this option are in top slot (simple signal)
+            top_slot_score = 0
+            if slot_map and voters:
+                # find slot with most overlap with voters
+                overlaps = []
+                for slot, users in slot_map.items():
+                    overlaps.append(len(set(voters) & set(users)))
+                top_slot_score = max(overlaps) if overlaps else 0
             if voters:
                 names = [get_user_display(guild, uid) for uid in voters]
-                if len(names) > 8:
-                    shown = names[:8]
-                    rest = len(names) - 8
-                    voters_line = ", ".join(shown) + f", und {rest} weitere..."
-                else:
-                    voters_line = ", ".join(names)
-                value = f"🗳️ {count} Stimmen\n👥 {voters_line}"
+                voters_line = ", ".join(names[:8]) + (f", und {len(names)-8} weitere..." if len(names)>8 else "")
+                value = f"🗳️ {count} Stimmen\n👥 {voters_line}\n🔎 Top-Slot‑Übereinstimmung: {top_slot_score}"
             else:
-                value = f"🗳️ {count} Stimmen\n👥 Keine Stimmen"
+                value = f"🗳️ {count} Stimmen\n👥 Keine Stimmen\n🔎 Top-Slot‑Übereinstimmung: {top_slot_score}"
             embed.add_field(name=opt_text or "(ohne Titel)", value=value, inline=False)
     return embed
 
+# PollVoteButton and PollView include AvailabilityButton
 class PollVoteButton(discord.ui.Button):
     def __init__(self, poll_id: str, option_id: int, option_text: str):
         custom = f"poll:vote:{poll_id}:{option_id}"
@@ -615,6 +754,12 @@ class PollView(discord.ui.View):
                 self.add_item(PollVoteButton(poll_id, opt_id, opt_text))
             except Exception:
                 log.exception("Failed to add PollVoteButton for poll %s option %s", poll_id, opt_id)
+        # availability button
+        try:
+            self.add_item(AvailabilityButton(poll_id))
+        except Exception:
+            pass
+        # add idea
         try:
             self.add_item(AddIdeaButton(poll_id))
         except Exception:
@@ -623,7 +768,8 @@ class PollView(discord.ui.View):
 async def post_poll_to_channel(channel: discord.TextChannel):
     poll_id = datetime.now(tz=ZoneInfo(POST_TIMEZONE)).strftime("%Y%m%dT%H%M%S")
     created_at = datetime.now(timezone.utc).isoformat()
-    db_execute("INSERT OR REPLACE INTO polls(id, created_at) VALUES (?, ?)", (poll_id, created_at))
+    db_execute("INSERT OR REPLACE INTO polls(id, created_at, posted_channel_id, posted_message_id) VALUES (?, ?, ?, ?)",
+               (poll_id, created_at, channel.id, None))
     embed = generate_poll_embed_from_db(poll_id, channel.guild)
     view = PollView(poll_id)
     try:
@@ -631,6 +777,11 @@ async def post_poll_to_channel(channel: discord.TextChannel):
     except Exception:
         pass
     sent = await channel.send(embed=embed, view=view)
+    # persist posted message id
+    try:
+        db_execute("UPDATE polls SET posted_message_id = ? WHERE id = ?", (sent.id, poll_id))
+    except Exception:
+        log.exception("Failed to persist poll posted_message_id")
     return poll_id, sent
 
 @bot.command()
@@ -653,6 +804,34 @@ async def listoptions(ctx, poll_id: str):
     rows = db_execute("SELECT id, option_text, created_at, author_id FROM options WHERE poll_id = ? ORDER BY id ASC", (poll_id,), fetch=True) or []
     pretty = [(r[0], r[1], r[2], get_user_display(ctx.guild, r[3]) if r[3] else None) for r in rows]
     await ctx.send(f"options for {poll_id}: {pretty}")
+
+# -------------------------
+# Matches command: summarize top slots and per-option scores
+# -------------------------
+@bot.command()
+async def matches(ctx, poll_id: str):
+    # compute slot participants
+    slot_map = compute_slot_participants_for_poll(poll_id)
+    if not slot_map:
+        await ctx.send("Keine Verfügbarkeitsdaten für diesen Poll gefunden.")
+        return
+    ranked = sorted(slot_map.items(), key=lambda kv: len(kv[1]), reverse=True)
+    lines = []
+    for (day,hour), users in ranked[:10]:
+        names = [get_user_display(ctx.guild, uid) for uid in list(users)[:8]]
+        more = len(users) - len(names)
+        names_str = ", ".join(names) + (f", und {more} weitere" if more>0 else "")
+        lines.append(f"{day} {hour:02d}:00 — {len(users)}: {names_str}")
+    # per-option: count how many voters for option are in top slot(s)
+    votes_map = get_votes_map_for_poll(poll_id)
+    top_slot = ranked[0][0] if ranked else None
+    per_option_lines = []
+    if top_slot:
+        top_users = ranked[0][1]
+        for opt_id, voters in votes_map.items():
+            overlap = len(set(voters) & set(top_users))
+            per_option_lines.append(f"Option {opt_id}: {len(voters)} Stimmen, {overlap} Stimmen in Top-Slot")
+    await ctx.send(f"Top Slots:\n" + "\n".join(lines[:5]) + ("\n\nPer-Option:\n" + "\n".join(per_option_lines) if per_option_lines else ""))
 
 # -------------------------
 # Debug commands
