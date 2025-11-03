@@ -1,24 +1,22 @@
 #!/usr/bin/env python3
 """
-Stable bot.py — corrected, syntactically-checked single-file replacement.
+Complete bot.py — full replacement, syntactically checked.
 
-This file is the corrected version of the last file I provided. I fixed the
-unbalanced try/except issue that repeatedly caused the "expected 'except' or
-'finally' block" SyntaxError around lines that reference EVENTS_CHANNEL_ID.
-
-I only changed/cleaned the code to ensure all try blocks have matching except
-handlers and removed any stray/mismatched indentation that could confuse the
-Python parser. Feature-wise this file matches the last integrated state:
-- Event handlers (create/update/delete) with tracked_events persistence
+Features:
+- Event handling: on_guild_scheduled_event_create/update/delete
 - Reminder scheduling (24h and 2h) with robust NotFound handling
-- RSVP UI with persistent views and event_rsvps persistence
-- Poll system (Part A + Part B): polls/options/votes, AddIdea modal, voting buttons
+- RSVP UI with persistent view registration attempts and event_rsvps persistence
+- Polls: polls/options/votes, !startpoll, AddIdea modal, voting buttons
 - Persistent view registration on startup
-- All try/except blocks balanced
+- Debug commands: checkevents, rsvpstatus, listpolls, listoptions, pollresults, ping
 
-Replace your current bot.py with this file (1:1). Start the container and paste the first ~60 log lines here if anything still fails — I'll fix immediately.
+Environment variables:
+- BOT_TOKEN (required)
+- POLL_DB (optional; default polls.sqlite)
+- CHANNEL_ID (optional)
+- EVENTS_CHANNEL_ID (optional; channel to post events)
+- POST_TIMEZONE (optional; default Europe/Berlin)
 """
-
 from __future__ import annotations
 
 import os
@@ -27,7 +25,6 @@ import logging
 import asyncio
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
-import io
 
 import discord
 from discord.ext import commands
@@ -35,7 +32,7 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.date import DateTrigger
 
 # -------------------------
-# Logging / config
+# Logging & config
 # -------------------------
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("bot")
@@ -124,7 +121,6 @@ def db_execute(query: str, params=(), fetch=False, many=False):
 # Scheduler
 # -------------------------
 scheduler = AsyncIOScheduler(timezone=ZoneInfo(POST_TIMEZONE))
-
 bot_inst = bot
 scheduler_inst = scheduler
 
@@ -140,7 +136,7 @@ def get_user_display(guild: discord.Guild | None, user_id: int) -> str:
     return getattr(u, "name", str(user_id))
 
 # -------------------------
-# Event embed / RSVP
+# Event embed / RSVP helpers
 # -------------------------
 def build_event_embed_from_db(discord_event_id: str, guild: discord.Guild | None = None) -> discord.Embed:
     rows = db_execute("SELECT discord_event_id, start_time FROM tracked_events WHERE discord_event_id = ?", (discord_event_id,), fetch=True) or []
@@ -170,7 +166,7 @@ def build_event_embed_from_db(discord_event_id: str, guild: discord.Guild | None
     return embed
 
 # -------------------------
-# RSVP View
+# EventRSVP View
 # -------------------------
 class EventRSVPView(discord.ui.View):
     def __init__(self, discord_event_id: str, guild: discord.Guild | None):
@@ -224,7 +220,7 @@ class EventRSVPView(discord.ui.View):
                 pass
 
 # -------------------------
-# Reminder scheduling + coro
+# Reminder scheduling & coroutine
 # -------------------------
 async def reminder_coro(channel_id: int, discord_event_id: str, hours_before: int):
     ch = bot.get_channel(channel_id)
@@ -267,7 +263,6 @@ async def reminder_coro(channel_id: int, discord_event_id: str, hours_before: in
         log.exception("Failed sending reminder message for %s", discord_event_id)
 
 def schedule_reminders_for_event(bot_inst_local, scheduler_inst_local, discord_event_id: str, start_time):
-    # remove existing jobs safely
     try:
         scheduler_inst_local.remove_job(f"event_reminder_24_{discord_event_id}")
     except Exception:
@@ -308,68 +303,116 @@ def schedule_reminders_for_event(bot_inst_local, scheduler_inst_local, discord_e
 # -------------------------
 @bot.event
 async def on_guild_scheduled_event_create(event: discord.ScheduledEvent):
-    log.info("EVENT_CREATE id=%s name=%s", getattr(event, "id", None), getattr(event, "name", None))
+    log.info(
+        "EVENT_CREATE id=%s name=%s",
+        getattr(event, "id", None),
+        getattr(event, "name", None),
+    )
+
+    # If no target channel is configured, nothing to do
     if not EVENTS_CHANNEL_ID:
         log.info("EVENTS_CHANNEL_ID not set; ignoring scheduled event create")
         return
 
+    discord_event_id = str(event.id)
+    guild_id = event.guild.id if getattr(event, "guild", None) else None
+    start_iso = event.start_time.isoformat() if event.start_time else None
+    now_iso = datetime.now(timezone.utc).isoformat()
+
+    # Ensure we persist (insert or replace) the tracked_events row first.
     try:
-        discord_event_id = str(event.id)
-        start_iso = event.start_time.isoformat() if event.start_time else None
-        guild_id = event.guild.id if getattr(event, "guild", None) else None
-        now_iso = datetime.now(timezone.utc).isoformat()
-
-        db_execute("INSERT OR REPLACE INTO tracked_events(guild_id, discord_event_id, start_time, updated_at) VALUES (?, ?, ?, ?)",
-                   (guild_id, discord_event_id, start_iso, now_iso))
-
-        tracked = db_execute("SELECT posted_channel_id, posted_message_id FROM tracked_events WHERE discord_event_id = ?", (discord_event_id,), fetch=True)
-        if tracked:
-            posted_ch_id, posted_msg_id = tracked[0]
-            if posted_msg_id:
-                try:
-                    ch_check = bot.get_channel(posted_ch_id) if posted_ch_id else None
-                    if ch_check:
-                        try:
-                            _ = await ch_check.fetch_message(posted_msg_id)
-                            log.info("Event %s already posted as message %s — skipping", discord_event_id, posted_msg_id)
-                            try:
-                                schedule_reminders_for_event(bot_inst, scheduler_inst, discord_event_id, event.start_time)
-                            except Exception:
-                                log.exception("Failed scheduling reminders (create)")
-                            return
-                        except discord.NotFound:
-                            db_execute("UPDATE tracked_events SET posted_channel_id = NULL, posted_message_id = NULL WHERE discord_event_id = ?", (discord_event_id,))
-                        except Exception:
-                            log.exception("Error verifying existing posted message")
+        db_execute(
+            "INSERT OR REPLACE INTO tracked_events(guild_id, discord_event_id, start_time, updated_at) VALUES (?, ?, ?, ?)",
+            (guild_id, discord_event_id, start_iso, now_iso),
+        )
     except Exception:
-        # ensure this try has an except so parser is happy; rest of handler continues below
-        log.exception("Error during pre-post checks in on_guild_scheduled_event_create")
+        log.exception("Failed to insert/replace tracked_events row for %s", discord_event_id)
 
-    # continue posting (this section is intentionally outside the above try to avoid leaving a try unclosed)
-    if not EVENTS_CHANNEL_ID:
-        log.info("EVENTS_CHANNEL_ID not set after pre-check; skipping post.")
-        return
+    # Check whether we already have a posted message recorded and if it still exists.
+    try:
+        tracked = db_execute(
+            "SELECT posted_channel_id, posted_message_id FROM tracked_events WHERE discord_event_id = ?",
+            (discord_event_id,),
+            fetch=True,
+        ) or []
+    except Exception:
+        log.exception("DB error when reading tracked_events for %s", discord_event_id)
+        tracked = []
 
+    if tracked:
+        posted_ch_id, posted_msg_id = tracked[0]
+        if posted_msg_id:
+            ch_check = bot.get_channel(posted_ch_id) if posted_ch_id else None
+            if ch_check:
+                try:
+                    # If the message still exists, we skip posting a duplicate.
+                    await ch_check.fetch_message(posted_msg_id)
+                    log.info("Event %s already posted as message %s — skipping", discord_event_id, posted_msg_id)
+                    # Still ensure reminders are scheduled / rescheduled
+                    try:
+                        schedule_reminders_for_event(bot_inst, scheduler_inst, discord_event_id, event.start_time)
+                    except Exception:
+                        log.exception("Failed scheduling reminders for existing posted event %s", discord_event_id)
+                    return
+                except discord.NotFound:
+                    # The recorded message is gone — clear DB refs and continue to post anew.
+                    try:
+                        db_execute(
+                            "UPDATE tracked_events SET posted_channel_id = NULL, posted_message_id = NULL WHERE discord_event_id = ?",
+                            (discord_event_id,),
+                        )
+                        log.info("Cleared stale posted refs for event %s", discord_event_id)
+                    except Exception:
+                        log.exception("Failed clearing stale posted refs for %s", discord_event_id)
+                except Exception:
+                    log.exception("Error while verifying existing posted message for %s", discord_event_id)
+
+    # At this point either there was no tracked posted message, or it was removed; attempt to post.
     ch = bot.get_channel(EVENTS_CHANNEL_ID)
     if not ch:
-        log.warning("Events channel %s not found", EVENTS_CHANNEL_ID)
+        log.warning("Events channel %s not found or inaccessible; cannot post event %s", EVENTS_CHANNEL_ID, discord_event_id)
         return
 
     try:
-        embed = build_event_embed_from_db(str(event.id), event.guild)
+        embed = discord.Embed(
+            title=event.name or "Event",
+            description=event.description or "",
+            color=discord.Color.blue(),
+            timestamp=datetime.now(timezone.utc),
+        )
+        if event.start_time:
+            try:
+                embed.add_field(
+                    name="Start",
+                    value=event.start_time.astimezone(ZoneInfo(POST_TIMEZONE)).strftime("%d.%m.%Y %H:%M %Z"),
+                    inline=False,
+                )
+            except Exception:
+                embed.add_field(name="Start", value=str(event.start_time), inline=False)
+
+        # register persistent view instance before sending (best-effort)
         try:
-            bot.add_view(EventRSVPView(str(event.id), event.guild))
+            bot.add_view(EventRSVPView(discord_event_id, event.guild))
         except Exception:
-            pass
-        sent = await ch.send(embed=embed, view=EventRSVPView(str(event.id), event.guild))
-        db_execute("UPDATE tracked_events SET posted_channel_id = ?, posted_message_id = ?, updated_at = ? WHERE discord_event_id = ?",
-                   (ch.id, sent.id, datetime.now(timezone.utc).isoformat(), str(event.id)))
+            log.debug("bot.add_view(EventRSVPView) failed (non-fatal)")
+
+        sent = await ch.send(embed=embed, view=EventRSVPView(discord_event_id, event.guild))
         try:
-            schedule_reminders_for_event(bot_inst, scheduler_inst, str(event.id), event.start_time)
+            db_execute(
+                "UPDATE tracked_events SET posted_channel_id = ?, posted_message_id = ?, updated_at = ? WHERE discord_event_id = ?",
+                (ch.id, sent.id, datetime.now(timezone.utc).isoformat(), discord_event_id),
+            )
         except Exception:
-            log.exception("Failed scheduling reminders after post")
+            log.exception("Failed to update tracked_events after posting event %s", discord_event_id)
+
+        # schedule reminders for this event (best-effort)
+        try:
+            schedule_reminders_for_event(bot_inst, scheduler_inst, discord_event_id, event.start_time)
+        except Exception:
+            log.exception("Failed scheduling reminders after posting event %s", discord_event_id)
+
     except Exception:
-        log.exception("Failed to post event message in on_guild_scheduled_event_create")
+        log.exception("Failed to post event message for %s", discord_event_id)
 
 @bot.event
 async def on_guild_scheduled_event_update(event: discord.ScheduledEvent):
