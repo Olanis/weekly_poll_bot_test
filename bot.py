@@ -2,16 +2,12 @@
 """
 Weekly poll bot with persistent storage (SQLite) and weekly scheduling (Europe/Berlin).
 
-Features:
-- Posts a poll every Sunday 12:00 (noon) Berlin time.
-- Posts a daily summary (matches + new ideas since yesterday) at 09:00 Europe/Berlin,
-  but only if there are new ideas since yesterday OR any matches exist.
-- Stores polls, options, votes and availabilities in SQLite so data survives restarts.
-- Interactive availability editor is ephemeral (only visible to the invoking user).
-- Matches are shown directly in the poll embed.
-- "📝 Idee hinzufügen" opens an ephemeral view where the user can add a new idea (modal)
-  and see / delete their own ideas with a red × button.
-- Manual commands: !startpoll, !dailysummary, !deleteidea (compat).
+This version:
+- Reverts "📝 Idee hinzufügen" to the simple modal-only flow (no ephemeral AddOptionView).
+- Removes any UI or commands to delete user's own ideas (no delete buttons, no !deleteidea command).
+- Keeps voting (multi-vote), availability editor, weekly poll, and daily summary logic.
+- Daily summary only posts if there are new ideas since yesterday OR matches exist.
+- Uses timezone-aware UTC timestamps for DB records.
 """
 import os
 import sqlite3
@@ -51,7 +47,7 @@ def init_db():
         )
         """
     )
-    # options (ideas) table (with created_at and author_id)
+    # options (ideas) table (with created_at; keep author_id column if present but no deletion UI)
     cur.execute(
         """
         CREATE TABLE IF NOT EXISTS options (
@@ -77,7 +73,7 @@ def init_db():
         )
         """
     )
-    # availability table (persisted per user per poll)
+    # availability table
     cur.execute(
         """
         CREATE TABLE IF NOT EXISTS availability (
@@ -89,7 +85,7 @@ def init_db():
         )
         """
     )
-    # daily_summaries table: store last summary message id per channel
+    # daily_summaries
     cur.execute(
         """
         CREATE TABLE IF NOT EXISTS daily_summaries (
@@ -153,7 +149,6 @@ def user_display_name(guild: discord.Guild | None, user_id: int) -> str:
 # Persistence helpers for polls
 # -------------------------
 def create_poll_record(poll_id: str):
-    # use timezone-aware UTC timestamp
     db_execute("INSERT OR REPLACE INTO polls(id, created_at) VALUES (?, ?)", (poll_id, datetime.now(timezone.utc).isoformat()))
 
 def add_option(poll_id: str, option_text: str, author_id: int = None):
@@ -191,9 +186,6 @@ def get_availability_for_poll(poll_id: str):
 def get_options_since(poll_id: str, since_dt: datetime):
     rows = db_execute("SELECT option_text, created_at FROM options WHERE poll_id = ? AND created_at >= ? ORDER BY created_at ASC", (poll_id, since_dt.isoformat()), fetch=True)
     return rows or []
-
-def get_user_options(poll_id: str, user_id: int):
-    return db_execute("SELECT id, option_text, created_at FROM options WHERE poll_id = ? AND author_id = ? ORDER BY id ASC", (poll_id, user_id), fetch=True) or []
 
 # -------------------------
 # Embed generation
@@ -258,14 +250,6 @@ def format_slot_range(slot: str) -> str:
 # -------------------------
 # UI: Views & Buttons
 # -------------------------
-class OpenSuggestModalButton(discord.ui.Button):
-    def __init__(self, poll_id: str):
-        super().__init__(label="📝 Neue Idee", style=discord.ButtonStyle.success)
-        self.poll_id = poll_id
-
-    async def callback(self, interaction: discord.Interaction):
-        await interaction.response.send_modal(SuggestModal(self.poll_id))
-
 class SuggestModal(discord.ui.Modal, title="Neue Idee hinzufügen"):
     idea = discord.ui.TextInput(label="Deine Idee", placeholder="z. B. Minecraft zocken", max_length=100)
 
@@ -279,39 +263,14 @@ class SuggestModal(discord.ui.Modal, title="Neue Idee hinzufügen"):
             await interaction.response.send_message("Leere Idee verworfen.", ephemeral=True)
             return
         add_option(self.poll_id, text, author_id=interaction.user.id)
-        try:
-            refreshed = AddOptionView(self.poll_id, interaction.user.id)
-            embed = discord.Embed(title="📝 Idee hinzugefügt", description="✅ Deine Idee wurde hinzugefügt.", color=discord.Color.green(), timestamp=datetime.now())
-            await interaction.response.send_message(embed=embed, ephemeral=True)
-            await interaction.followup.send("🔁 Aktualisierte Liste deiner Ideen:", view=refreshed, ephemeral=True)
-        except Exception:
-            try:
-                await interaction.response.send_message("✅ Idee hinzugefügt.", ephemeral=True)
-            except Exception:
-                pass
-
-class DeleteOwnOptionButton(discord.ui.Button):
-    def __init__(self, poll_id: str, option_id: int, option_text: str, user_id: int):
-        super().__init__(label="✖️", style=discord.ButtonStyle.danger)
-        self.poll_id = poll_id
-        self.option_id = option_id
-        self.option_text = option_text
-        self.user_id = user_id
-
-    async def callback(self, interaction: discord.Interaction):
-        if interaction.user.id != self.user_id:
-            await interaction.response.send_message("❌ Du kannst nur deine eigenen Ideen löschen.", ephemeral=True)
-            return
-        db_execute("DELETE FROM options WHERE id = ?", (self.option_id,))
-        db_execute("DELETE FROM votes WHERE option_id = ?", (self.option_id,))
-        await interaction.response.send_message(f"✅ Idee gelöscht: {self.option_text}", ephemeral=True)
-        # try to update the public poll message in the channel where the ephemeral action originated
+        # Try to update the public poll message (best-effort)
         try:
             channel = interaction.channel
             async for msg in channel.history(limit=200):
                 if msg.author == bot.user and msg.embeds:
                     em = msg.embeds[0]
                     if em.title and em.title.startswith("📋 Worauf"):
+                        # update embed
                         rows = db_execute("SELECT id FROM polls ORDER BY created_at DESC LIMIT 1", fetch=True)
                         if rows:
                             poll_id = rows[0][0]
@@ -324,30 +283,7 @@ class DeleteOwnOptionButton(discord.ui.Button):
                         break
         except Exception:
             pass
-        # refresh ephemeral view
-        try:
-            refreshed = AddOptionView(self.poll_id, self.user_id)
-            await interaction.followup.send("🔄 Aktualisierte Liste deiner Ideen:", view=refreshed, ephemeral=True)
-        except Exception:
-            pass
-
-class AddOptionView(discord.ui.View):
-    def __init__(self, poll_id: str, user_id: int):
-        super().__init__(timeout=None)
-        self.poll_id = poll_id
-        self.user_id = user_id
-        self.add_item(OpenSuggestModalButton(poll_id))
-        user_opts = get_user_options(poll_id, user_id)
-        if not user_opts:
-            info = discord.ui.Button(label="Du hast noch keine eigenen Ideen.", style=discord.ButtonStyle.secondary, disabled=True)
-            self.add_item(info)
-        else:
-            for opt_id, opt_text, created in user_opts:
-                label = opt_text if len(opt_text) <= 80 else opt_text[:77] + "..."
-                display_btn = discord.ui.Button(label=label, style=discord.ButtonStyle.secondary, disabled=True)
-                self.add_item(display_btn)
-                del_btn = DeleteOwnOptionButton(poll_id, opt_id, opt_text, user_id)
-                self.add_item(del_btn)
+        await interaction.response.send_message("✅ Idee hinzugefügt.", ephemeral=True)
 
 class AddOptionButton(discord.ui.Button):
     def __init__(self, poll_id: str):
@@ -355,9 +291,8 @@ class AddOptionButton(discord.ui.Button):
         self.poll_id = poll_id
 
     async def callback(self, interaction: discord.Interaction):
-        view = AddOptionView(self.poll_id, interaction.user.id)
-        embed = discord.Embed(title="📝 Ideen verwalten", description="Füge neue Ideen hinzu oder lösche eigene Ideen. Nur du siehst diese Ansicht.", color=discord.Color.greyple(), timestamp=datetime.now())
-        await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
+        # Open modal immediately for idea input
+        await interaction.response.send_modal(SuggestModal(self.poll_id))
 
 class AddAvailabilityButton(discord.ui.Button):
     def __init__(self, poll_id: str):
@@ -563,7 +498,6 @@ async def post_poll_to_channel(channel: discord.abc.Messageable):
 # Daily summary helpers
 # -------------------------
 async def post_daily_summary():
-    """Scheduled job that selects channel by CHANNEL_ID or first sendable channel."""
     await bot.wait_until_ready()
     channel = None
     if CHANNEL_ID:
@@ -586,9 +520,6 @@ async def post_daily_summary():
     await post_daily_summary_to(channel)
 
 async def post_daily_summary_to(channel: discord.TextChannel):
-    """Post or update the daily summary into the given channel.
-    Only posts if there are new options since yesterday OR there are matches.
-    """
     rows = db_execute("SELECT id, created_at FROM polls ORDER BY created_at DESC LIMIT 1", fetch=True)
     if not rows:
         return
@@ -599,11 +530,9 @@ async def post_daily_summary_to(channel: discord.TextChannel):
     matches = compute_matches_for_poll_from_db(poll_id)
 
     if (not new_options) and (not matches):
-        # nothing new -> do not send/update daily summary
         return
 
     embed = discord.Embed(title="🗓️ Tages-Update: Matches & neue Ideen", color=discord.Color.green(), timestamp=datetime.now())
-    # New options
     if new_options:
         lines = []
         for opt_text, created_at in new_options:
@@ -617,7 +546,6 @@ async def post_daily_summary_to(channel: discord.TextChannel):
     else:
         embed.add_field(name="🆕 Neue Ideen seit gestern", value="Keine", inline=False)
 
-    # Matches
     if matches:
         for opt_text, infos in matches.items():
             lines = []
@@ -632,7 +560,6 @@ async def post_daily_summary_to(channel: discord.TextChannel):
     else:
         embed.add_field(name="🤝 Matches", value="Keine gemeinsamen Zeiten für Optionen mit ≥2 Stimmen.", inline=False)
 
-    # delete previous daily summary in this channel (if any)
     last_msg_id = get_last_daily_summary(channel.id)
     if last_msg_id:
         try:
@@ -701,41 +628,7 @@ async def dailysummary(ctx):
     await post_daily_summary_to(ctx.channel)
     await ctx.send("✅ Daily Summary gesendet (falls neue Inhalte vorhanden).", delete_after=6)
 
-@bot.command()
-async def deleteidea(ctx, option_id: int):
-    """Compatibility: delete your own idea by option id (kept for compatibility)."""
-    rows = db_execute("SELECT poll_id, option_text, author_id FROM options WHERE id = ?", (option_id,), fetch=True)
-    if not rows:
-        await ctx.send(f"❌ Idee mit id {option_id} nicht gefunden.")
-        return
-    poll_id, option_text, author_id = rows[0]
-    if author_id is None:
-        await ctx.send("❌ Diese Idee kann nicht mit diesem Befehl gelöscht werden (kein Autor vermerkt).")
-        return
-    if author_id != ctx.author.id:
-        await ctx.send("❌ Du kannst nur deine eigenen Ideen löschen.")
-        return
-    db_execute("DELETE FROM options WHERE id = ?", (option_id,))
-    db_execute("DELETE FROM votes WHERE option_id = ?", (option_id,))
-    await ctx.send(f"✅ Deine Idee wurde gelöscht.", delete_after=8)
-    # update recent poll message in this channel (best-effort)
-    try:
-        async for msg in ctx.channel.history(limit=100):
-            if msg.author == bot.user and msg.embeds:
-                em = msg.embeds[0]
-                if em.title and em.title.startswith("📋 Worauf"):
-                    rows = db_execute("SELECT id FROM polls ORDER BY created_at DESC LIMIT 1", fetch=True)
-                    if rows:
-                        poll_id = rows[0][0]
-                        new_embed = generate_poll_embed_from_db(poll_id, ctx.guild)
-                        new_view = PollView(poll_id)
-                        try:
-                            await msg.edit(embed=new_embed, view=new_view)
-                        except Exception:
-                            pass
-                    break
-    except Exception:
-        pass
+# Note: deleteidea command removed as requested (no user-facing deletion available now).
 
 # -------------------------
 # Bot events
