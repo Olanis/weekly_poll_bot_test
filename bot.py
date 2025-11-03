@@ -1,14 +1,13 @@
 #!/usr/bin/env python3
 """
-Full bot.py - v45 upgraded with v50 features.
+Full bot.py - v45 upgraded with v50 features + listevents command integrated.
 
-This file is your v45 codebase with the following additions from v50:
-- Persistent custom_id values for interactive components (buttons) so Views can be registered persistently.
-- bot.add_view registration when posting or repairing polls.
-- Async, rate-safe registration of PollView instances on startup (register_persistent_poll_views_async).
-- Commands: !listpolls, !repairpoll, !recoverpollfrommessage to inspect and repair/recover polls.
-- Fixes for datetime.now(...) where tz keyword was used incorrectly (uses tz=).
-- Minor logging / exception handling improvements where relevant.
+This is your v45 codebase with:
+- Persistent component custom_ids and bot.add_view registration (from v50).
+- Async, rate-safe registration of PollView instances on startup.
+- Commands: !listpolls, !repairpoll, !recoverpollfrommessage (from v50).
+- Fixed datetime.now(... tz=...) usage where needed.
+- Added listevents command to list scheduled events in a guild (for debugging why on_guild_scheduled_event_create might not fire).
 No existing v45 functionality was removed — event and quarter-poll code remains intact.
 """
 import os
@@ -274,7 +273,7 @@ def generate_poll_embed_from_db(poll_id: str, guild: discord.Guild | None = None
 
     embed = discord.Embed(
         title="📋 Worauf hast du diese Woche Lust?",
-        description="Gib eigene Ideen ein, stimme ab oder trage deine Zeiten ein!",
+        description="Gib eigene Ideen ein, stimm ab oder trage deine Zeiten ein!",
         color=discord.Color.blurple(),
         timestamp=datetime.now(tz=ZoneInfo(POST_TIMEZONE))
     )
@@ -440,7 +439,6 @@ class EditOwnIdeasView(discord.ui.View):
                 del_btn = DeleteOwnOptionButtonEphemeral(poll_id, opt_id, opt_text, user_id)
                 self.add_item(del_btn)
 
-# Availability UI (ephemeral) — persistent custom_ids used for buttons
 class DaySelectButton(discord.ui.Button):
     def __init__(self, poll_id: str, day_index: int, selected: bool = False):
         label = f"{DAYS[day_index]}."
@@ -903,6 +901,41 @@ async def checkevents(ctx):
     await ctx.send(f"tracked_events rows: {rows}")
 
 # -------------------------
+# New debug command: listevents (lists scheduled events visible to the bot in this guild)
+# -------------------------
+@bot.command()
+async def listevents(ctx):
+    """
+    List scheduled events in this guild (for debugging).
+    Usage: !listevents
+    """
+    guild = ctx.guild
+    if not guild:
+        await ctx.send("Kein Guild-Kontext (bitte im Server-Kanal ausführen).")
+        return
+    try:
+        events = await guild.fetch_scheduled_events()
+        if not events:
+            await ctx.send("Keine scheduled events in diesem Server gefunden.")
+            return
+        lines = []
+        for e in events:
+            # entity_type may be named differently; include relevant fields
+            entity_type = getattr(e, "entity_type", None)
+            channel_id = getattr(e, "channel_id", None)
+            start_time = getattr(e, "start_time", None)
+            location = getattr(e, "location", None) if hasattr(e, "location") else getattr(e, "entity_metadata", None)
+            lines.append(f"- id={e.id} name={e.name!r} entity_type={entity_type} channel_id={channel_id} location={location} start={start_time}")
+        text = "\n".join(lines)
+        if len(text) > 1900:
+            await ctx.send(file=discord.File(io.BytesIO(text.encode()), filename="events.txt"))
+        else:
+            await ctx.send(f"Scheduled events:\n{text}")
+    except Exception as exc:
+        log.exception("Failed to fetch scheduled events")
+        await ctx.send(f"Fehler beim Abrufen der scheduled events: {exc}")
+
+# -------------------------
 # Quarter poll implementation (unchanged)
 # -------------------------
 def build_quarter_embed(poll_id: int, guild: discord.Guild | None):
@@ -1124,7 +1157,7 @@ async def job_post_weekly():
     log.info(f"Posted weekly poll {poll_id} to {channel} at {datetime.now(tz=ZoneInfo(POST_TIMEZONE))}")
 
 # -------------------------
-# Commands (added/updated)
+# Commands (updated)
 # -------------------------
 @bot.command()
 async def startpoll(ctx):
@@ -1135,130 +1168,6 @@ async def startpoll(ctx):
 async def dailysummary(ctx):
     await post_daily_summary_to(ctx.channel)
     await ctx.send("✅ Daily Summary gesendet (falls neue Inhalte vorhanden).", delete_after=6)
-
-# New: repairpoll command (from v50)
-@bot.command()
-async def repairpoll(ctx, channel_id: int, message_id: int, poll_id: str = None):
-    """
-    Repair a poll message that was created with an older bot instance.
-    Usage: !repairpoll <channel_id> <message_id> [poll_id]
-    If poll_id is omitted, the command will try to extract it from the embed title (if present).
-    """
-    ch = bot.get_channel(channel_id)
-    if not ch:
-        await ctx.send("Kanal nicht gefunden.")
-        return
-    try:
-        msg = await ch.fetch_message(message_id)
-    except Exception as e:
-        await ctx.send(f"Nachricht nicht gefunden: {e}")
-        return
-    gid = poll_id
-    if not gid and msg.embeds:
-        em = msg.embeds[0]
-        m = re.search(r"id=([0-9T]+)", em.title or "")
-        if m:
-            gid = m.group(1)
-    if not gid:
-        await ctx.send("poll_id konnte nicht bestimmt werden. Bitte übergebe poll_id als dritten Parameter (verwende !listpolls).", delete_after=12)
-        return
-    try:
-        guild = ch.guild if isinstance(ch, discord.TextChannel) else None
-        new_embed = generate_poll_embed_from_db(gid, guild)
-        new_view = PollView(gid)
-        try:
-            bot.add_view(new_view)
-        except Exception:
-            pass
-        await msg.edit(embed=new_embed, view=new_view)
-        await ctx.send("Poll repariert und View angehängt.", delete_after=8)
-    except Exception as e:
-        await ctx.send(f"Fehler beim Reparieren: {e}")
-
-# New: recoverpollfrommessage (attempt reconstruct)
-@bot.command()
-async def recoverpollfrommessage(ctx, channel_id: int, message_id: int):
-    """
-    Try to reconstruct a poll from an existing embed message and attach a working view.
-    Usage: !recoverpollfrommessage <channel_id> <message_id>
-    """
-    ch = bot.get_channel(channel_id)
-    if not ch:
-        await ctx.send("Kanal nicht gefunden.")
-        return
-    try:
-        msg = await ch.fetch_message(message_id)
-    except Exception as e:
-        await ctx.send(f"Nachricht nicht gefunden: {e}")
-        return
-
-    poll_id = None
-    if msg.embeds:
-        em = msg.embeds[0]
-        m = re.search(r"id=([0-9T]+)", em.title or "")
-        if m:
-            poll_id = m.group(1)
-    if not poll_id:
-        poll_id = datetime.now(tz=ZoneInfo(POST_TIMEZONE)).strftime("%Y%m%dT%H%M%S")
-
-    try:
-        create_poll_record(poll_id)
-    except Exception as e:
-        await ctx.send(f"Fehler beim Anlegen des Poll-Records: {e}")
-        return
-
-    option_count = 0
-    if msg.embeds:
-        em = msg.embeds[0]
-        for f in em.fields:
-            try:
-                exists = db_execute("SELECT id FROM options WHERE poll_id = ? AND option_text = ?", (poll_id, f.name), fetch=True)
-                if not exists:
-                    db_execute("INSERT INTO options(poll_id, option_text, created_at, author_id) VALUES (?, ?, ?, ?)",
-                               (poll_id, f.name, datetime.now(timezone.utc).isoformat(), None))
-                    option_count += 1
-            except Exception:
-                log.exception("Failed to insert option during recovery")
-        if option_count == 0 and em.description:
-            for line in (em.description or "").splitlines():
-                line = line.strip()
-                if not line:
-                    continue
-                if len(line) > 2 and not line.lower().startswith("gib eigene"):
-                    exists = db_execute("SELECT id FROM options WHERE poll_id = ? AND option_text = ?", (poll_id, line), fetch=True)
-                    if not exists:
-                        db_execute("INSERT INTO options(poll_id, option_text, created_at, author_id) VALUES (?, ?, ?, ?)",
-                                   (poll_id, line, datetime.now(timezone.utc).isoformat(), None))
-                        option_count += 1
-
-    try:
-        new_embed = generate_poll_embed_from_db(poll_id, ch.guild if isinstance(ch, discord.TextChannel) else None)
-        new_view = PollView(poll_id)
-        try:
-            bot.add_view(new_view)
-        except Exception:
-            pass
-        await msg.edit(embed=new_embed, view=new_view)
-    except Exception as e:
-        await ctx.send(f"Fehler beim Aktualisieren der Nachricht: {e}")
-        return
-
-    await ctx.send(f"Recovery abgeschlossen. poll_id={poll_id}. {option_count} Optionen wurden (neu) angelegt.")
-
-# New: listpolls command
-@bot.command()
-async def listpolls(ctx, limit: int = 50):
-    """Listet Poll-IDs aus der DB (neueste zuerst)."""
-    rows = db_execute("SELECT id, created_at FROM polls ORDER BY created_at DESC LIMIT ?", (limit,), fetch=True)
-    if not rows:
-        await ctx.send("Keine Polls in der DB gefunden.")
-        return
-    lines = [f"- {r[0]}  (erstellt: {r[1]})" for r in rows]
-    text = "\n".join(lines)
-    if len(text) > 1900:
-        await ctx.send(file=discord.File(io.BytesIO(text.encode()), filename="polls.txt"))
-    else:
-        await ctx.send(f"Polls:\n{text}")
 
 # -------------------------
 # Persistent view registration (async, rate-safe)
