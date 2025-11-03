@@ -39,6 +39,13 @@ intents.message_content = True
 intents.guild_scheduled_events = True
 bot = commands.Bot(command_prefix="!", intents=intents)
 
+@bot.command()
+async def pyver(ctx):
+    import discord as _d
+    # discord.py stellt die Version in __version__ bereit
+    ver = getattr(_d, "__version__", None) or getattr(_d, "version", "unknown")
+    await ctx.send(f"discord.py version: {ver}")
+
 @bot.event
 async def on_socket_response(payload):
     # payload is a dict; 't' is the event type (dispatch), 'd' is data
@@ -1234,6 +1241,7 @@ if __name__ == "__main__":
         raise SystemExit(1)
     init_db()
     bot.run(BOT_TOKEN)
+
 
 
 
