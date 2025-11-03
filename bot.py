@@ -314,9 +314,11 @@ class AddAvailabilityButton(discord.ui.Button):
 
 # New: open-your-ideas button (visible to everyone) — opens ephemeral EditOwnIdeasView for the clicker
 # Changed to icon-only label as requested
+# Replace the existing OpenEditOwnIdeasButton class in your bot.py with this updated version.
 class OpenEditOwnIdeasButton(discord.ui.Button):
     def __init__(self, poll_id: str):
-        super().__init__(label="🛠️", style=discord.ButtonStyle.secondary)
+        # use gear icon (Zahnrad) instead of the previous hammer/wrench icon
+        super().__init__(label="⚙️", style=discord.ButtonStyle.secondary)
         self.poll_id = poll_id
 
     async def callback(self, interaction: discord.Interaction):
@@ -326,8 +328,8 @@ class OpenEditOwnIdeasButton(discord.ui.Button):
             await interaction.response.send_message("ℹ️ Du hast noch keine eigenen Ideen in dieser Umfrage.", ephemeral=True)
             return
         view = EditOwnIdeasView(self.poll_id, user_id)
-        await interaction.response.send_message("🛠️ Deine eigenen Ideen (nur für dich sichtbar):", view=view, ephemeral=True)
-
+        await interaction.response.send_message("⚙️ Deine eigenen Ideen (nur für dich sichtbar):", view=view, ephemeral=True)
+      
 # Ephemeral view that lists only the invoking user's own ideas and shows delete buttons
 class DeleteOwnOptionButtonEphemeral(discord.ui.Button):
     def __init__(self, poll_id: str, option_id: int, option_text: str, user_id: int):
@@ -737,3 +739,4 @@ if __name__ == "__main__":
         raise SystemExit(1)
     init_db()
     bot.run(BOT_TOKEN)
+
