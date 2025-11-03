@@ -5,13 +5,15 @@ Main bot entrypoint. Integrates:
 - event watcher module (modules/events.py)
 - quarter poll module (modules/quarter_poll.py)
 
-The event and quarter_poll modules are initialized in on_ready() after DB init and scheduler start.
+This file is the integrated version with the missing wrapper post_daily_summary()
+added so scheduled jobs can call post_daily_summary without NameError.
+
 Environment variables required:
 - BOT_TOKEN
 - POLL_DB (optional, default polls.sqlite)
 - CHANNEL_ID (optional, existing poll channel)
-- EVENTS_CHANNEL_ID (required for events module)
-- QUARTER_POLL_CHANNEL_ID (required for quarter poll module)
+- EVENTS_CHANNEL_ID (optional, channel for event posts/reminders)
+- QUARTER_POLL_CHANNEL_ID (optional, channel for quarterly polls)
 """
 import os
 import sqlite3
@@ -153,7 +155,7 @@ def user_display_name(guild: discord.Guild | None, user_id: int) -> str:
     return user.name if user else str(user_id)
 
 # -------------------------
-# Poll persistence & helpers (reused from previous implementation)
+# Poll persistence & helpers (reused)
 # -------------------------
 def create_poll_record(poll_id: str):
     db_execute("INSERT OR REPLACE INTO polls(id, created_at) VALUES (?, ?)", (poll_id, datetime.now(timezone.utc).isoformat()))
@@ -166,6 +168,9 @@ def add_option(poll_id: str, option_text: str, author_id: int = None):
 
 def get_options(poll_id: str):
     return db_execute("SELECT id, option_text, created_at, author_id FROM options WHERE poll_id = ? ORDER BY id ASC", (poll_id,), fetch=True) or []
+
+def get_user_options(poll_id: str, user_id: int):
+    return db_execute("SELECT id, option_text, created_at FROM options WHERE poll_id = ? AND author_id = ? ORDER BY id ASC", (poll_id, user_id), fetch=True) or []
 
 def add_vote(poll_id: str, option_id: int, user_id: int):
     try:
@@ -279,7 +284,7 @@ def generate_poll_embed_from_db(poll_id: str, guild: discord.Guild | None = None
     return embed
 
 # -------------------------
-# UI: minimal Poll UI (buttons/modal), keep as before
+# UI: minimal Poll UI (buttons/modal)
 # -------------------------
 class SuggestModal(discord.ui.Modal, title="Neue Idee hinzufügen"):
     idea = discord.ui.TextInput(label="Deine Idee", placeholder="z. B. Minecraft zocken", max_length=100)
@@ -391,13 +396,145 @@ class EditOwnIdeasView(discord.ui.View):
                 del_btn = DeleteOwnOptionButtonEphemeral(poll_id, opt_id, opt_text, user_id)
                 self.add_item(del_btn)
 
-# Availability UI and PollView (omitted here for brevity but assumed identical to earlier full implementation)
-# For brevity in this integrator file, we assume the rest of the poll-related classes and functions
-# (AvailabilityDayView, DaySelectButton, HourButton, SubmitButton, RemovePersistedButton, PollView, PollButton, etc.)
-# are present as in previous full bot versions. If not, re-use your existing implementations.
+# Availability UI (omitted detailed classes for brevity — assume same as previous full implementation)
+class DaySelectButton(discord.ui.Button):
+    def __init__(self, poll_id: str, day_index: int, selected: bool = False):
+        label = f"{DAYS[day_index]}."
+        style = discord.ButtonStyle.success if selected else discord.ButtonStyle.secondary
+        super().__init__(label=label, style=style, custom_id=f"day:{poll_id}:{day_index}")
+        self.poll_id = poll_id
+        self.day_index = day_index
+    async def callback(self, interaction: discord.Interaction):
+        new_view = AvailabilityDayView(self.poll_id, day_index=self.day_index, for_user=interaction.user.id)
+        await interaction.response.edit_message(view=new_view)
+
+class HourButton(discord.ui.Button):
+    def __init__(self, poll_id: str, day: str, hour: int):
+        label = slot_label_range(day, hour)
+        super().__init__(label=label, style=discord.ButtonStyle.secondary, custom_id=f"hour:{poll_id}:{day}:{hour}")
+        self.poll_id = poll_id
+        self.day = day
+        self.hour = hour
+        self.slot = f"{day}-{hour}"
+    async def callback(self, interaction: discord.Interaction):
+        uid = interaction.user.id
+        _tmp = temp_selections.setdefault(self.poll_id, {})
+        user_tmp = _tmp.setdefault(uid, set())
+        if self.slot in user_tmp:
+            user_tmp.remove(self.slot)
+        else:
+            user_tmp.add(self.slot)
+        day_index = getattr(self.view, "day_index", 0)
+        new_view = AvailabilityDayView(self.poll_id, day_index=day_index, for_user=uid)
+        await interaction.response.edit_message(view=new_view)
+
+class SubmitButton(discord.ui.Button):
+    def __init__(self, poll_id: str):
+        super().__init__(label="✅ Absenden", style=discord.ButtonStyle.success)
+        self.poll_id = poll_id
+    async def callback(self, interaction: discord.Interaction):
+        uid = interaction.user.id
+        user_tmp = temp_selections.get(self.poll_id, {}).get(uid, set())
+        persist_availability(self.poll_id, uid, list(user_tmp))
+        if self.poll_id in temp_selections and uid in temp_selections[self.poll_id]:
+            temp_selections[self.poll_id].pop(uid, None)
+        persisted = db_execute("SELECT slot FROM availability WHERE poll_id = ? AND user_id = ?", (self.poll_id, uid), fetch=True)
+        readable = ", ".join([format_slot_range(r[0]) for r in persisted]) if persisted else "keine"
+        await interaction.response.send_message(f"✅ Deine Zeiten wurden gespeichert: {readable}", ephemeral=True)
+        try:
+            await interaction.message.edit(view=AvailabilityDayView(self.poll_id, day_index=getattr(self.view, "day_index", 0), for_user=uid))
+        except Exception:
+            pass
+
+class RemovePersistedButton(discord.ui.Button):
+    def __init__(self, poll_id: str):
+        super().__init__(label="🗑️ Gespeicherte Zeit löschen", style=discord.ButtonStyle.danger)
+        self.poll_id = poll_id
+    async def callback(self, interaction: discord.Interaction):
+        uid = interaction.user.id
+        db_execute("DELETE FROM availability WHERE poll_id = ? AND user_id = ?", (self.poll_id, uid))
+        if self.poll_id in temp_selections:
+            temp_selections[self.poll_id].pop(uid, None)
+        await interaction.response.send_message("🗑️ Deine gespeicherten Zeiten wurden gelöscht.", ephemeral=True)
+        try:
+            await interaction.message.edit(view=AvailabilityDayView(self.poll_id, day_index=getattr(self.view, "day_index", 0), for_user=uid))
+        except Exception:
+            pass
+
+class AvailabilityDayView(discord.ui.View):
+    def __init__(self, poll_id: str, day_index: int = 0, for_user: int = None):
+        super().__init__(timeout=None)
+        self.poll_id = poll_id
+        self.day_index = day_index
+        self.for_user = for_user
+        if for_user is not None:
+            poll_tmp = temp_selections.setdefault(poll_id, {})
+            if for_user not in poll_tmp:
+                persisted = db_execute("SELECT slot FROM availability WHERE poll_id = ? AND user_id = ?", (poll_id, for_user), fetch=True)
+                poll_tmp[for_user] = set(r[0] for r in persisted)
+        day_rows = (len(DAYS) + 5 - 1) // 5
+        for idx in range(len(DAYS)):
+            btn = DaySelectButton(poll_id, idx, selected=(idx == day_index))
+            btn.row = idx // 5
+            self.add_item(btn)
+        day = DAYS[day_index]
+        uid = for_user
+        user_temp = temp_selections.get(poll_id, {}).get(uid, set())
+        for i, hour in enumerate(HOURS):
+            btn = HourButton(poll_id, day, hour)
+            btn.row = day_rows + (i // 5)
+            slot = f"{day}-{hour}"
+            selected = (slot in user_temp)
+            if selected:
+                btn.style = discord.ButtonStyle.success
+                btn.label = f"✅ {slot_label_range(day, hour)}"
+            else:
+                btn.style = discord.ButtonStyle.secondary
+                btn.label = slot_label_range(day, hour)
+            self.add_item(btn)
+        last_hour_row = day_rows + ((len(HOURS) - 1) // 5)
+        controls_row = min(4, last_hour_row + 1)
+        submit = SubmitButton(poll_id)
+        submit.row = controls_row
+        remove = RemovePersistedButton(poll_id)
+        remove.row = controls_row
+        self.add_item(submit)
+        self.add_item(remove)
+
+# in-memory temporary selections
+temp_selections = {}
+
+class PollView(discord.ui.View):
+    def __init__(self, poll_id: str):
+        super().__init__(timeout=None)
+        self.poll_id = poll_id
+        options = get_options(poll_id)
+        for opt_id, opt_text, _created, author_id in options:
+            self.add_item(PollButton(poll_id, opt_id, opt_text))
+        # action buttons
+        self.add_item(AddOptionButton(poll_id))
+        self.add_item(AddAvailabilityButton(poll_id))
+        self.add_item(OpenEditOwnIdeasButton(poll_id))
+
+class PollButton(discord.ui.Button):
+    def __init__(self, poll_id: str, option_id: int, option_text: str):
+        super().__init__(label=option_text, style=discord.ButtonStyle.primary)
+        self.poll_id = poll_id
+        self.option_id = option_id
+    async def callback(self, interaction: discord.Interaction):
+        uid = interaction.user.id
+        rows = db_execute("SELECT 1 FROM votes WHERE poll_id = ? AND option_id = ? AND user_id = ?", (self.poll_id, self.option_id, uid), fetch=True)
+        if rows:
+            remove_vote(self.poll_id, self.option_id, uid)
+        else:
+            add_vote(self.poll_id, self.option_id, uid)
+        # regenerate embed so matches update immediately
+        embed = generate_poll_embed_from_db(self.poll_id, interaction.guild)
+        new_view = PollView(self.poll_id)
+        await interaction.response.edit_message(embed=embed, view=new_view)
 
 # -------------------------
-# Posting polls & daily summaries (assumed existing)
+# Posting polls & daily summaries
 # -------------------------
 async def post_poll_to_channel(channel: discord.abc.Messageable):
     poll_id = datetime.now(ZoneInfo(POST_TIMEZONE)).strftime("%Y%m%dT%H%M%S")
@@ -407,7 +544,34 @@ async def post_poll_to_channel(channel: discord.abc.Messageable):
     await channel.send(embed=embed, view=view)
     return poll_id
 
-# Daily summary helpers (assumed present; keep original behavior)
+# ---------- MISSING wrapper (added) ----------
+# Wrapper for scheduled jobs: find channel and call post_daily_summary_to(channel)
+async def post_daily_summary():
+    """Scheduled job entrypoint: find target channel (by CHANNEL_ID or first sendable) and call post_daily_summary_to."""
+    await bot.wait_until_ready()
+    channel = None
+    if CHANNEL_ID:
+        channel = bot.get_channel(CHANNEL_ID)
+    if not channel:
+        for g in bot.guilds:
+            for ch in g.text_channels:
+                try:
+                    perms = ch.permissions_for(g.me)
+                    if perms.send_messages:
+                        channel = ch
+                        break
+                except Exception:
+                    continue
+            if channel:
+                break
+    if not channel:
+        print("Kein Kanal gefunden für Daily Summary.")
+        return
+    # delegate to the channel-specific function
+    await post_daily_summary_to(channel)
+# ---------------------------------------------
+
+# Helpers for daily summaries persistence
 def get_last_daily_summary(channel_id: int):
     rows = db_execute("SELECT message_id FROM daily_summaries WHERE channel_id = ?", (channel_id,), fetch=True)
     return rows[0][0] if rows and rows[0][0] is not None else None
@@ -417,8 +581,82 @@ def set_last_daily_summary(channel_id: int, message_id: int):
     db_execute("INSERT OR REPLACE INTO daily_summaries(channel_id, message_id, created_at) VALUES (?, ?, ?)", (channel_id, message_id, now))
 
 async def post_daily_summary_to(channel: discord.TextChannel):
-    # Implement summary logic as in your current bot (omitted for brevity)
-    pass
+    rows = db_execute("SELECT id, created_at FROM polls ORDER BY created_at DESC LIMIT 1", fetch=True)
+    if not rows:
+        return
+    poll_id, poll_created = rows[0]
+    tz = ZoneInfo(POST_TIMEZONE)
+    since = datetime.now(tz) - timedelta(days=1)
+    new_options = get_options_since(poll_id, since)
+    matches = compute_matches_for_poll_from_db(poll_id)
+
+    if (not new_options) and (not matches):
+        return
+
+    embed = discord.Embed(title="🗓️ Tages-Update: Matches & neue Ideen", color=discord.Color.green(), timestamp=datetime.now())
+    # neutral wording (no "since yesterday")
+    if new_options:
+        lines = []
+        for opt_text, created_at in new_options:
+            try:
+                t = datetime.fromisoformat(created_at).astimezone(tz)
+                tstr = t.strftime("%d.%m. %H:%M")
+            except Exception:
+                tstr = created_at
+            lines.append(f"- {opt_text} (hinzugefügt {tstr})")
+        embed.add_field(name="🆕 Neue Ideen", value="\n".join(lines), inline=False)
+    else:
+        embed.add_field(name="🆕 Neue Ideen", value="Keine", inline=False)
+
+    if matches:
+        for opt_text, infos in matches.items():
+            lines = []
+            for info in infos:
+                slot = info["slot"]
+                day, hour_s = slot.split("-")
+                hour = int(hour_s)
+                timestr = slot_label_range(day, hour)
+                names = [user_display_name(channel.guild if isinstance(channel, discord.TextChannel) else None, u) for u in info["users"]]
+                lines.append(f"{timestr}: {', '.join(names)}")
+            embed.add_field(name=f"🤝 Matches — {opt_text}", value="\n".join(lines), inline=False)
+    else:
+        embed.add_field(name="🤝 Matches", value="Keine gemeinsamen Zeiten für Optionen mit ≥2 Stimmen.", inline=False)
+
+    # Add list of voters without availability
+    voter_rows = db_execute("SELECT DISTINCT user_id FROM votes WHERE poll_id = ?", (poll_id,), fetch=True)
+    voters = [r[0] for r in voter_rows] if voter_rows else []
+    avail_rows = db_execute("SELECT DISTINCT user_id FROM availability WHERE poll_id = ?", (poll_id,), fetch=True)
+    has_avail = {r[0] for r in avail_rows} if avail_rows else set()
+    voters_no_avail = [uid for uid in voters if uid not in has_avail]
+    if voters_no_avail:
+        names = [user_display_name(channel.guild if isinstance(channel, discord.TextChannel) else None, uid) for uid in voters_no_avail]
+        if len(names) > 30:
+            shown = names[:30]
+            remaining = len(names) - 30
+            names_line = ", ".join(shown) + f", und {remaining} weitere..."
+        else:
+            names_line = ", ".join(names)
+        embed.add_field(name="ℹ️ Abstimmende ohne eingetragene Zeiten", value=names_line, inline=False)
+    else:
+        embed.add_field(name="ℹ️ Abstimmende ohne eingetragene Zeiten", value="Alle Abstimmenden haben Zeiten eingetragen.", inline=False)
+
+    # delete previous daily summary in this channel (if any)
+    last_msg_id = get_last_daily_summary(channel.id)
+    if last_msg_id:
+        try:
+            prev = await channel.fetch_message(last_msg_id)
+            if prev:
+                await prev.delete()
+        except discord.NotFound:
+            pass
+        except Exception:
+            pass
+
+    sent = await channel.send(embed=embed)
+    try:
+        set_last_daily_summary(channel.id, sent.id)
+    except Exception:
+        pass
 
 # -------------------------
 # Scheduler (existing)
@@ -460,7 +698,7 @@ async def job_post_weekly():
     print(f"Posted weekly poll {poll_id} to {channel} at {datetime.now()}")
 
 # -------------------------
-# Commands & events
+# Commands & helpers
 # -------------------------
 @bot.command()
 async def startpoll(ctx):
@@ -472,6 +710,9 @@ async def dailysummary(ctx):
     await post_daily_summary_to(ctx.channel)
     await ctx.send("✅ Daily Summary gesendet (falls neue Inhalte vorhanden).", delete_after=6)
 
+# -------------------------
+# Bot events & module initialization
+# -------------------------
 @bot.event
 async def on_ready():
     print(f"✅ Eingeloggt als {bot.user} (ID: {bot.user.id})")
