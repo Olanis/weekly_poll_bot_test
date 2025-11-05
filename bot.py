@@ -1,9 +1,7 @@
 #!/usr/bin/env python3
 """
-bot.py — full bot with modal fix: CreateEventModal reduced to 5 fields (no participants field),
-EditParticipantsModal added, FinalizeEventView updated. Added logging on send_modal failures.
-Also keeps previous changes: DD.MM.YYYY dates, Startdatum/Enddatum, no ephemeral availability confirmation,
-"Idee hinzufügen" green, etc.
+bot.py — full bot with two-step event creation, removed parentheses from date/time labels,
+creator automatically marked as interested, and silent availability save.
 
 Replace /app/bot.py with this file and restart the bot.
 """
@@ -613,11 +611,11 @@ class MatchButton(discord.ui.Button):
             "description": "",
             "location": "",
         }
-        modal = CreateEventModal(tmp_key)
+        modal = CreateEventStep1Modal(tmp_key)
         try:
             await interaction.response.send_modal(modal)
         except Exception:
-            log.exception("Failed to send CreateEventModal from MatchButton")
+            log.exception("Failed to send CreateEvent Step1 modal from MatchButton")
             try:
                 await interaction.response.send_message("Fehler beim Öffnen des Event-Modals.", ephemeral=True)
             except Exception:
@@ -648,11 +646,11 @@ class NewEventButton(discord.ui.Button):
             "description": "",
             "location": "",
         }
-        modal = CreateEventModal(tmp_key)
+        modal = CreateEventStep1Modal(tmp_key)
         try:
             await interaction.response.send_modal(modal)
         except Exception:
-            log.exception("Failed to send CreateEventModal from NewEventButton")
+            log.exception("Failed to send CreateEvent Step1 modal from NewEventButton")
             try:
                 await interaction.response.send_message("Fehler beim Öffnen des Event-Modals.", ephemeral=True)
             except Exception:
@@ -701,34 +699,54 @@ class CreateEventButton(discord.ui.Button):
         except Exception:
             log.exception("Failed to open matches view from CreateEventButton")
 
-# CreateEvent modal: Startdatum, Enddatum (DD.MM.YYYY) + Startzeit/Endzeit (HH:MM)
-class CreateEventModal(discord.ui.Modal):
+# Two-step Create Event Modals
+class CreateEventStep1Modal(discord.ui.Modal, title="Event: Titel & Beschreibung"):
     title_field = discord.ui.TextInput(label="Titel", max_length=100)
-    start_date_field = discord.ui.TextInput(label="Startdatum (DD.MM.YYYY)", placeholder="01.01.2026", max_length=20)
-    end_date_field = discord.ui.TextInput(label="Enddatum (DD.MM.YYYY)", placeholder="01.01.2026", max_length=20)
-    start_field = discord.ui.TextInput(label="Beginn (HH:MM)", placeholder="18:00", max_length=8)
-    end_field = discord.ui.TextInput(label="Ende (HH:MM)", placeholder="20:00", max_length=8)
-    # participants moved to separate modal to keep modal <= 5 inputs
+    description_field = discord.ui.TextInput(label="Beschreibung (optional)", style=discord.TextStyle.long, required=False, max_length=2000)
     def __init__(self, tmp_key: str):
-        super().__init__(title="Event erstellen")
+        super().__init__(title="Event: Titel & Beschreibung")
         self.tmp_key = tmp_key
         data = create_event_temp_storage.get(tmp_key, {})
         self.title_field.default = data.get("opt_text", "")
-        # defaults now in DD.MM.YYYY
+        self.description_field.default = data.get("description", "")
+    async def on_submit(self, interaction: discord.Interaction):
+        tmp = create_event_temp_storage.setdefault(self.tmp_key, {})
+        tmp["title"] = str(self.title_field.value).strip() or tmp.get("opt_text", "") or "Event"
+        tmp["description"] = str(self.description_field.value).strip()
+        # open step 2 modal (dates, times, location)
+        modal = CreateEventStep2Modal(self.tmp_key)
+        try:
+            await interaction.response.send_modal(modal)
+        except Exception:
+            log.exception("Failed to open CreateEvent Step2 modal from Step1")
+            try:
+                await interaction.response.send_message("Fehler beim Öffnen des nächsten Schritts.", ephemeral=True)
+            except Exception:
+                pass
+
+class CreateEventStep2Modal(discord.ui.Modal, title="Event: Datum, Zeit & Ort"):
+    start_date_field = discord.ui.TextInput(label="Startdatum", placeholder="01.01.2026", max_length=20)
+    end_date_field = discord.ui.TextInput(label="Enddatum", placeholder="01.01.2026", max_length=20)
+    start_field = discord.ui.TextInput(label="Beginn", placeholder="18:00", max_length=8)
+    end_field = discord.ui.TextInput(label="Ende", placeholder="20:00", max_length=8)
+    location_field = discord.ui.TextInput(label="Ort (Voice-Channel-Name oder Text)", required=False, max_length=200)
+    # This modal uses exactly 5 fields to respect Discord's limit.
+    def __init__(self, tmp_key: str):
+        super().__init__(title="Event: Datum, Zeit & Ort")
+        self.tmp_key = tmp_key
+        data = create_event_temp_storage.get(tmp_key, {})
         self.start_date_field.default = data.get("default_start_date", "")
         self.end_date_field.default = data.get("default_end_date", "")
         self.start_field.default = data.get("default_start", "18:00")
         self.end_field.default = data.get("default_end", "19:00")
+        self.location_field.default = data.get("default_location", "")
     async def on_submit(self, interaction: discord.Interaction):
-        tmp = create_event_temp_storage.get(self.tmp_key, {})
-        poll_id = tmp.get("poll_id")
-        opt_text = tmp.get("opt_text", "")
-        uids = tmp.get("uids", [])
-        title = str(self.title_field.value).strip() or opt_text or "Event"
+        tmp = create_event_temp_storage.setdefault(self.tmp_key, {})
         start_date_str = str(self.start_date_field.value).strip()
         end_date_str = str(self.end_date_field.value).strip()
         start_time_str = str(self.start_field.value).strip()
         end_time_str = str(self.end_field.value).strip()
+        location = str(self.location_field.value).strip()
 
         start_date = parse_date_ddmmyyyy(start_date_str)
         end_date = parse_date_ddmmyyyy(end_date_str)
@@ -739,37 +757,35 @@ class CreateEventModal(discord.ui.Modal):
             try:
                 await interaction.response.send_message("Datum/Uhrzeit konnte nicht geparst. Bitte benutze DD.MM.YYYY und HH:MM.", ephemeral=True)
             except Exception:
-                log.exception("Failed to send invalid-date ephemeral")
+                log.exception("Failed to send invalid-date ephemeral from Step2")
             return
 
         tz = ZoneInfo(POST_TIMEZONE)
         start_dt = datetime(start_date.year, start_date.month, start_date.day, start_time.hour, start_time.minute, tzinfo=tz)
         end_dt = datetime(end_date.year, end_date.month, end_date.day, end_time.hour, end_time.minute, tzinfo=tz)
 
-        tmp_storage = create_event_temp_storage.setdefault(self.tmp_key, {})
-        # keep participants_text if previously set, else use mentions provided in tmp
-        tmp_storage.update({
-            "title": title,
+        tmp.update({
             "start_dt": start_dt.isoformat(),
             "end_dt": end_dt.isoformat(),
-            "participants_text": tmp_storage.get("participants_text", tmp.get("mentions", "")),
-            "location": tmp.get("default_location", ""),
-            "description": tmp.get("description", ""),
-            "poll_id": poll_id,
+            "location": location or tmp.get("default_location", ""),
+            # participants_text remains as previously set (if any in tmp)
+            "participants_text": tmp.get("participants_text", tmp.get("mentions", "")),
         })
+
         view = FinalizeEventView(self.tmp_key, interaction.user.id)
         summary_lines = [
-            f"**Titel:** {title}",
+            f"**Titel:** {tmp.get('title')}",
             f"**Startdatum:** {start_date.strftime('%d.%m.%Y')}",
             f"**Beginn:** {start_time.strftime('%H:%M')}",
             f"**Enddatum:** {end_date.strftime('%d.%m.%Y')}",
             f"**Ende:** {end_time.strftime('%H:%M')}",
-            f"**Teilnehmende:** {tmp_storage.get('participants_text') or '—'}",
+            f"**Ort:** {tmp.get('location') or '—'}",
+            f"**Teilnehmende:** {tmp.get('participants_text') or '—'}",
         ]
         try:
             await interaction.response.send_message("Event-Entwurf:\n" + "\n".join(summary_lines), view=view, ephemeral=True)
         except Exception:
-            log.exception("Failed to send event draft after CreateEventModal submit")
+            log.exception("Failed to send event draft after Step2 submit")
 
 class EditParticipantsModal(discord.ui.Modal, title="Teilnehmende bearbeiten"):
     participants_field = discord.ui.TextInput(label="Teilnehmende (Erwähnungen, z.B. @user)", style=discord.TextStyle.long, required=False, max_length=1000)
@@ -874,6 +890,14 @@ class FinalizeEventView(discord.ui.View):
             except Exception:
                 pass
             return
+
+        # Automatically mark the creator as interested/participant
+        try:
+            creator_uid = interaction.user.id
+            db_execute("INSERT OR IGNORE INTO created_event_rsvps(event_id, user_id) VALUES (?, ?)", (event_id, creator_uid))
+        except Exception:
+            log.exception("Failed adding creator to RSVPs")
+
         target_channel = None
         if CREATED_EVENTS_CHANNEL_ID:
             target_channel = bot.get_channel(CREATED_EVENTS_CHANNEL_ID)
@@ -1067,7 +1091,7 @@ class PollView(discord.ui.View):
         self.add_item(CreateEventButton(poll_id))        # event create (green calendar)
         self.add_item(OpenEditOwnIdeasButton(poll_id))   # gear button
 
-# AddAvailabilityButton (defined after AvailabilityDayView above, but declared here for clarity)
+# AddAvailabilityButton
 class AddAvailabilityButton(discord.ui.Button):
     def __init__(self, poll_id: str):
         super().__init__(label="🕓 Verfügbarkeit hinzufügen", style=discord.ButtonStyle.success, custom_id=f"avail:{poll_id}")
