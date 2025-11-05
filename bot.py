@@ -1,22 +1,12 @@
 #!/usr/bin/env python3
 """
-bot.py — Complete file with stable ordering: all UI classes (Buttons, Modals, Views)
-are defined before any code that instantiates them (post_poll_to_channel, startpoll, scheduler reg).
-This prevents NameError for PollView and related classes.
-
-Features included:
-- Poll posting with voting buttons
-- Add idea modal (green button)
-- Availability grid (ephemeral, silent confirmation)
-- Two-step event creation (Step1: title+description, Step2: dates/times/location)
-- Event finalization, posting, RSVP (creator auto-registered)
-- Daily summaries, scheduled weekly poll posting, reminders for events
-- Defensive try/except and logging around interaction/modal calls
-- Date format DD.MM.YYYY and time HH:MM parsing/validation
+bot.py — full bot with robust two-step event creation:
+- Step1 saves title/description and returns an ephemeral "Weiter" button.
+- The "Weiter" button opens Step2 modal (dates/times/location).
+This avoids nested send_modal calls and the "Invalid Form Body" error.
 
 Replace your /app/bot.py with this file and restart the bot.
 """
-
 from __future__ import annotations
 
 import os
@@ -335,7 +325,7 @@ temp_selections: Dict[str, Dict[int, Set[str]]] = {}
 create_event_temp_storage: Dict[str, Dict] = {}
 
 # -------------------------
-# UI classes — define everything here BEFORE any code that instantiates PollView or related Views
+# UI classes (all defined before PollView)
 # -------------------------
 
 # Suggest / AddOption
@@ -711,7 +701,24 @@ class CreateEventButton(discord.ui.Button):
         except Exception:
             log.exception("Failed to open matches view from CreateEventButton")
 
-# CreateEventStep1Modal and Step2: use explicit TextStyle to avoid invalid component types
+# Continue button: opens Step2 modal from ephemeral message (avoids nested modal send from modal submit)
+class ContinueToStep2Button(discord.ui.Button):
+    def __init__(self, tmp_key: str):
+        super().__init__(label="Weiter", style=discord.ButtonStyle.primary)
+        self.tmp_key = tmp_key
+    async def callback(self, interaction: discord.Interaction):
+        # open step2 modal when user clicks Weiter
+        try:
+            modal = CreateEventStep2Modal(self.tmp_key)
+            await interaction.response.send_modal(modal)
+        except Exception:
+            log.exception("Failed to open CreateEvent Step2 modal from ContinueToStep2Button")
+            try:
+                await interaction.response.send_message("Fehler beim Öffnen des nächsten Schritts.", ephemeral=True)
+            except Exception:
+                pass
+
+# CreateEventStep1Modal now only stores title/description and returns an ephemeral "Weiter" button
 class CreateEventStep1Modal(discord.ui.Modal, title="Event: Titel & Beschreibung"):
     title_field = discord.ui.TextInput(label="Titel", style=discord.TextStyle.short, max_length=100)
     description_field = discord.ui.TextInput(label="Beschreibung (optional)", style=discord.TextStyle.long, required=False, max_length=2000)
@@ -723,18 +730,17 @@ class CreateEventStep1Modal(discord.ui.Modal, title="Event: Titel & Beschreibung
         self.description_field.default = str(data.get("description", "")) if data.get("description", None) is not None else ""
     async def on_submit(self, interaction: discord.Interaction):
         try:
+            # store minimal data only — no parsing or heavy processing here
             tmp = create_event_temp_storage.setdefault(self.tmp_key, {})
             tmp["title"] = str(self.title_field.value).strip() or tmp.get("opt_text", "") or "Event"
             tmp["description"] = str(self.description_field.value).strip()
-            modal = CreateEventStep2Modal(self.tmp_key)
+            # send ephemeral message with Weiter button to open Step2 modal
+            view = discord.ui.View(timeout=120)
+            view.add_item(ContinueToStep2Button(self.tmp_key))
             try:
-                await interaction.response.send_modal(modal)
+                await interaction.response.send_message("Titel und Beschreibung gespeichert. Klicke auf Weiter, um Datum & Zeit einzugeben.", view=view, ephemeral=True)
             except Exception:
-                log.exception("Failed to open CreateEvent Step2 modal from Step1")
-                try:
-                    await interaction.response.send_message("Fehler beim Öffnen des nächsten Schritts.", ephemeral=True)
-                except Exception:
-                    pass
+                log.exception("Failed to send ephemeral Continue message after Step1 submit")
         except Exception:
             log.exception("Unhandled error in CreateEventStep1Modal.on_submit")
             try:
@@ -742,6 +748,7 @@ class CreateEventStep1Modal(discord.ui.Modal, title="Event: Titel & Beschreibung
             except Exception:
                 pass
 
+# CreateEventStep2Modal unchanged (dates/times/location)
 class CreateEventStep2Modal(discord.ui.Modal, title="Event: Datum, Zeit & Ort"):
     start_date_field = discord.ui.TextInput(label="Startdatum", style=discord.TextStyle.short, placeholder="01.01.2026", max_length=20)
     end_date_field = discord.ui.TextInput(label="Enddatum", style=discord.TextStyle.short, placeholder="01.01.2026", max_length=20)
@@ -943,7 +950,6 @@ class FinalizeEventView(discord.ui.View):
         except Exception:
             end_dt = None
 
-        # Build embed with separate date and time fields (no parentheses/zone)
         embed = discord.Embed(title=f"📣 {title}", description=description or "", color=discord.Color.orange(), timestamp=datetime.now(timezone.utc))
         if start_dt:
             try:
@@ -1042,6 +1048,39 @@ class EventSignupView(discord.ui.View):
         except Exception:
             log.exception("Failed to update posted message after RSVP toggle")
 
+async def build_created_event_embed(event_id: str, guild: Optional[discord.Guild] = None) -> discord.Embed:
+    rows = db_execute("SELECT title, description, start_time, end_time, participants, location FROM created_events WHERE id = ?", (event_id,), fetch=True) or []
+    if not rows:
+        return discord.Embed(title="Event", description="(Details fehlen)", color=discord.Color.dark_grey())
+    title, description, start_iso, end_iso, participants_text, location = rows[0]
+    embed = discord.Embed(title=f"📣 {title}", description=description or "", color=discord.Color.orange(), timestamp=datetime.now(timezone.utc))
+    if start_iso:
+        try:
+            dt = datetime.fromisoformat(start_iso)
+            embed.add_field(name="Startdatum", value=dt.strftime("%d.%m.%Y"), inline=True)
+            embed.add_field(name="Beginn", value=dt.strftime("%H:%M"), inline=True)
+        except Exception:
+            embed.add_field(name="Start", value=start_iso, inline=False)
+    if end_iso:
+        try:
+            dt = datetime.fromisoformat(end_iso)
+            embed.add_field(name="Enddatum", value=dt.strftime("%d.%m.%Y"), inline=True)
+            embed.add_field(name="Ende", value=dt.strftime("%H:%M"), inline=True)
+        except Exception:
+            embed.add_field(name="Ende", value=end_iso, inline=False)
+    if participants_text:
+        embed.add_field(name="Teilnehmende", value=participants_text, inline=False)
+    rows2 = db_execute("SELECT user_id FROM created_event_rsvps WHERE event_id = ?", (event_id,), fetch=True) or []
+    user_ids = [r[0] for r in rows2]
+    if user_ids:
+        names = [user_display_name(guild, uid) for uid in user_ids]
+        embed.add_field(name="Interessiert", value=", ".join(names[:20]) + (f", und {len(names)-20} weitere..." if len(names)>20 else ""), inline=False)
+    else:
+        embed.add_field(name="Interessiert", value="Keine", inline=False)
+    if location:
+        embed.add_field(name="Ort", value=location, inline=False)
+    return embed
+
 # Poll button & PollView (defined after all dependencies above)
 class PollButton(discord.ui.Button):
     def __init__(self, poll_id: str, option_id: int, option_text: str):
@@ -1061,7 +1100,6 @@ class PollButton(discord.ui.Button):
             bot.add_view(new_view)
             await interaction.response.edit_message(embed=embed, view=new_view)
         except Exception:
-            # fallback: edit only embed
             try:
                 await interaction.response.edit_message(embed=embed)
             except Exception:
@@ -1095,7 +1133,7 @@ class PollView(discord.ui.View):
         except Exception:
             pass
 
-# AddAvailabilityButton (referenced above)
+# AddAvailabilityButton (defined after AvailabilityDayView above, but declared here)
 class AddAvailabilityButton(discord.ui.Button):
     def __init__(self, poll_id: str):
         super().__init__(label="🕓 Verfügbarkeit hinzufügen", style=discord.ButtonStyle.success, custom_id=f"avail:{poll_id}")
@@ -1118,7 +1156,7 @@ class AddAvailabilityButton(discord.ui.Button):
                 pass
 
 # -------------------------
-# Reminders & scheduler setup
+# Reminders & scheduler setup (unchanged)
 # -------------------------
 scheduler = AsyncIOScheduler(timezone=ZoneInfo(POST_TIMEZONE))
 
@@ -1218,7 +1256,7 @@ async def _created_event_reminder_coro(event_id: str, channel_id: int, hours_bef
         log.exception("Failed to send reminder for created event %s", event_id)
 
 # -------------------------
-# Posting polls & commands
+# Posting polls & commands (unchanged)
 # -------------------------
 async def post_poll_to_channel(channel: discord.abc.Messageable):
     poll_id = datetime.now(tz=ZoneInfo(POST_TIMEZONE)).strftime("%Y%m%dT%H%M%S")
@@ -1254,7 +1292,7 @@ async def listpolls(ctx, limit: int = 50):
     else:
         await ctx.send(f"Polls:\n{text}")
 
-# Daily summary helpers
+# Daily summary helpers (unchanged)
 def get_last_daily_summary(channel_id: int):
     rows = db_execute("SELECT message_id FROM daily_summaries WHERE channel_id = ?", (channel_id,), fetch=True)
     return rows[0][0] if rows and rows[0][0] is not None else None
