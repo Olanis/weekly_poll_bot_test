@@ -1,25 +1,10 @@
 #!/usr/bin/env python3
 """
-Complete bot.py — reordered and cleaned so no NameError occurs.
+bot.py — updated per your requests (availability confirmation removed; Startdatum/Enddatum fields using DD.MM.YYYY;
+time fields kept; embeds show date and time separately w/o parentheses/zone).
 
-What I changed:
-- Reorganized the file so ALL button/view classes are defined before PollView is instantiated.
-- Kept all previously requested features:
-  - "Idee hinzufügen" button is green and does not send a separate confirmation message.
-  - "Verfügbarkeit hinzufügen" opens an ephemeral AvailabilityDayView grid, saving selections.
-  - "Event erstellen" opens an ephemeral match-selection embed with clickable buttons and always includes "Neues Event".
-  - Match entries show full slot range and participant names.
-  - Created events get posted, support RSVP, and schedule 24h/1h reminders.
-- Restored stable ordering so you won't see NameError: name 'X' is not defined when creating polls.
-- Added defensive try/except around interaction handlers to avoid unhandled crashes.
-
-Replace your /app/bot.py with this file and restart the bot.
-
-Notes:
-- I intentionally grouped all UI classes into a single section (modals, simple buttons, availability buttons, edit-own-ideas, event-creation buttons, event finalization, signup view) before PollView and before any code that constructs views.
-- This avoids fragile ordering problems that caused the NameError cascade.
+Replace your running bot.py with this file (1:1).
 """
-
 from __future__ import annotations
 
 import os
@@ -27,7 +12,7 @@ import io
 import sqlite3
 import asyncio
 import logging
-from datetime import datetime, timedelta, timezone, date
+from datetime import datetime, timedelta, timezone, date, time as _time
 from zoneinfo import ZoneInfo
 from typing import Optional, List, Dict, Set
 
@@ -175,6 +160,29 @@ def next_date_for_day_short(day_short: str, tz: ZoneInfo = ZoneInfo(POST_TIMEZON
     days_ahead = (target - today.weekday() + 7) % 7
     return today + timedelta(days=days_ahead)
 
+def date_to_ddmmyyyy(d: date) -> str:
+    return d.strftime("%d.%m.%Y")
+
+def parse_date_ddmmyyyy(s: str) -> Optional[date]:
+    s = s.strip()
+    try:
+        parts = s.split(".")
+        if len(parts) == 3:
+            d, m, y = map(int, parts)
+            return date(y, m, d)
+        # try ISO fallback
+        return date.fromisoformat(s)
+    except Exception:
+        return None
+
+def parse_time_hhmm(s: str) -> Optional[_time]:
+    s = s.strip()
+    try:
+        hh, mm = map(int, s.split(":"))
+        return _time(hh, mm)
+    except Exception:
+        return None
+
 # -------------------------
 # Poll persistence helpers
 # -------------------------
@@ -312,7 +320,7 @@ temp_selections: Dict[str, Dict[int, Set[str]]] = {}
 create_event_temp_storage: Dict[str, Dict] = {}
 
 # -------------------------
-# UI classes (all defined here, before PollView)
+# UI classes (all defined before PollView)
 # -------------------------
 
 # Suggest / AddOption
@@ -346,7 +354,6 @@ class SuggestModal(discord.ui.Modal, title="Neue Idee hinzufügen"):
                             break
         except Exception:
             log.exception("Best-effort update failed")
-        # defer so user doesn't see extra confirmation
         try:
             await interaction.response.defer(ephemeral=True)
         except Exception:
@@ -370,7 +377,10 @@ class DaySelectButton(discord.ui.Button):
         self.day_index = day_index
     async def callback(self, interaction: discord.Interaction):
         new_view = AvailabilityDayView(self.poll_id, day_index=self.day_index, for_user=interaction.user.id)
-        await interaction.response.edit_message(view=new_view)
+        try:
+            await interaction.response.edit_message(view=new_view)
+        except Exception:
+            pass
 
 class HourButton(discord.ui.Button):
     def __init__(self, poll_id: str, day: str, hour: int):
@@ -391,28 +401,32 @@ class HourButton(discord.ui.Button):
             user_tmp.add(self.slot)
         day_index = getattr(self.view, "day_index", 0)
         new_view = AvailabilityDayView(self.poll_id, day_index=day_index, for_user=uid)
-        await interaction.response.edit_message(view=new_view)
+        try:
+            await interaction.response.edit_message(view=new_view)
+        except Exception:
+            pass
 
 class SubmitButton(discord.ui.Button):
     def __init__(self, poll_id: str):
         super().__init__(label="✅ Absenden", style=discord.ButtonStyle.success, custom_id=f"submit:{poll_id}")
         self.poll_id = poll_id
     async def callback(self, interaction: discord.Interaction):
+        # Persist selections, but DO NOT send ephemeral confirmation message as requested.
         uid = interaction.user.id
         user_tmp = temp_selections.get(self.poll_id, {}).get(uid, set())
         persist_availability(self.poll_id, uid, list(user_tmp))
         if self.poll_id in temp_selections and uid in temp_selections[self.poll_id]:
             temp_selections[self.poll_id].pop(uid, None)
-        persisted = db_execute("SELECT slot FROM availability WHERE poll_id = ? AND user_id = ?", (self.poll_id, uid), fetch=True)
-        readable = ", ".join([format_slot_range(r[0]) for r in persisted]) if persisted else "keine"
+        # Update the ephemeral view to reflect saved state (silent feedback)
         try:
-            await interaction.response.send_message(f"✅ Deine Zeiten wurden gespeichert: {readable}", ephemeral=True)
+            # edit the ephemeral message view to the current day view (no explicit confirmation)
+            await interaction.response.edit_message(view=AvailabilityDayView(self.poll_id, day_index=getattr(self.view, "day_index", 0), for_user=uid))
         except Exception:
-            pass
-        try:
-            await interaction.message.edit(view=AvailabilityDayView(self.poll_id, day_index=getattr(self.view, "day_index", 0), for_user=uid))
-        except Exception:
-            pass
+            # if editing fails (e.g., no original message), just defer
+            try:
+                await interaction.response.defer(ephemeral=True)
+            except Exception:
+                pass
 
 class RemovePersistedButton(discord.ui.Button):
     def __init__(self, poll_id: str):
@@ -424,13 +438,13 @@ class RemovePersistedButton(discord.ui.Button):
         if self.poll_id in temp_selections:
             temp_selections[self.poll_id].pop(uid, None)
         try:
-            await interaction.response.send_message("🗑️ Deine gespeicherten Zeiten wurden gelöscht.", ephemeral=True)
+            # reflect cleared state in the ephemeral view
+            await interaction.response.edit_message(view=AvailabilityDayView(self.poll_id, day_index=getattr(self.view, "day_index", 0), for_user=uid))
         except Exception:
-            pass
-        try:
-            await interaction.message.edit(view=AvailabilityDayView(self.poll_id, day_index=getattr(self.view, "day_index", 0), for_user=uid))
-        except Exception:
-            pass
+            try:
+                await interaction.response.defer(ephemeral=True)
+            except Exception:
+                pass
 
 class AvailabilityDayView(discord.ui.View):
     def __init__(self, poll_id: str, day_index: int = 0, for_user: int = None):
@@ -484,7 +498,10 @@ class DeleteOwnOptionButtonEphemeral(discord.ui.Button):
         self.user_id = user_id
     async def callback(self, interaction: discord.Interaction):
         if interaction.user.id != self.user_id:
-            await interaction.response.send_message("❌ Nur du kannst diese Idee hier löschen.", ephemeral=True)
+            try:
+                await interaction.response.send_message("❌ Nur du kannst diese Idee hier löschen.", ephemeral=True)
+            except Exception:
+                pass
             return
         db_execute("DELETE FROM options WHERE id = ?", (self.option_id,))
         db_execute("DELETE FROM votes WHERE option_id = ?", (self.option_id,))
@@ -492,7 +509,7 @@ class DeleteOwnOptionButtonEphemeral(discord.ui.Button):
             await interaction.response.send_message(f"✅ Idee gelöscht: {self.option_text}", ephemeral=True)
         except Exception:
             pass
-        # best-effort update poll messages
+        # best-effort update poll in channel
         try:
             if interaction.channel:
                 async for msg in interaction.channel.history(limit=200):
@@ -553,7 +570,7 @@ class OpenEditOwnIdeasButton(discord.ui.Button):
         except Exception:
             pass
 
-# Event creation UI
+# Event creation UI (match selection / modal)
 class MatchButton(discord.ui.Button):
     def __init__(self, poll_id: str, matches_key: str, index: int):
         super().__init__(label=f"Wähle {index+1}", style=discord.ButtonStyle.primary)
@@ -585,7 +602,8 @@ class MatchButton(discord.ui.Button):
             "opt_text": opt_text,
             "slot": slot,
             "uids": uids,
-            "default_date": dt_date.isoformat(),
+            "default_start_date": date_to_ddmmyyyy(dt_date),
+            "default_end_date": date_to_ddmmyyyy(dt_date),
             "default_start": f"{hour:02d}:00",
             "default_end": f"{(hour+1)%24:02d}:00",
             "mentions": " ".join(f"<@{u}>" for u in uids),
@@ -615,7 +633,8 @@ class NewEventButton(discord.ui.Button):
             "opt_text": "",
             "slot": None,
             "uids": [],
-            "default_date": date.today().isoformat(),
+            "default_start_date": date_to_ddmmyyyy(date.today()),
+            "default_end_date": date_to_ddmmyyyy(date.today()),
             "default_start": "18:00",
             "default_end": "19:00",
             "mentions": "",
@@ -672,9 +691,11 @@ class CreateEventButton(discord.ui.Button):
         except Exception:
             pass
 
+# CreateEvent modal: Startdatum, Enddatum (DD.MM.YYYY) + Startzeit/Endzeit (HH:MM)
 class CreateEventModal(discord.ui.Modal):
     title_field = discord.ui.TextInput(label="Titel", max_length=100)
-    date_field = discord.ui.TextInput(label="Datum (YYYY-MM-DD)", placeholder="2025-11-07", max_length=20)
+    start_date_field = discord.ui.TextInput(label="Startdatum (DD.MM.YYYY)", placeholder="01.01.2026", max_length=20)
+    end_date_field = discord.ui.TextInput(label="Enddatum (DD.MM.YYYY)", placeholder="01.01.2026", max_length=20)
     start_field = discord.ui.TextInput(label="Beginn (HH:MM)", placeholder="18:00", max_length=8)
     end_field = discord.ui.TextInput(label="Ende (HH:MM)", placeholder="20:00", max_length=8)
     participants_field = discord.ui.TextInput(label="Teilnehmende (Erwähnungen, z.B. @user)", style=discord.TextStyle.long, required=False, max_length=1000)
@@ -683,7 +704,9 @@ class CreateEventModal(discord.ui.Modal):
         self.tmp_key = tmp_key
         data = create_event_temp_storage.get(tmp_key, {})
         self.title_field.default = data.get("opt_text", "")
-        self.date_field.default = data.get("default_date", "")
+        # defaults now in DD.MM.YYYY
+        self.start_date_field.default = data.get("default_start_date", "")
+        self.end_date_field.default = data.get("default_end_date", "")
         self.start_field.default = data.get("default_start", "18:00")
         self.end_field.default = data.get("default_end", "19:00")
         self.participants_field.default = data.get("mentions", "")
@@ -693,27 +716,28 @@ class CreateEventModal(discord.ui.Modal):
         opt_text = tmp.get("opt_text", "")
         uids = tmp.get("uids", [])
         title = str(self.title_field.value).strip() or opt_text or "Event"
-        date_str = str(self.date_field.value).strip()
-        start_str = str(self.start_field.value).strip()
-        end_str = str(self.end_field.value).strip()
+        start_date_str = str(self.start_date_field.value).strip()
+        end_date_str = str(self.end_date_field.value).strip()
+        start_time_str = str(self.start_field.value).strip()
+        end_time_str = str(self.end_field.value).strip()
         participants_text = str(self.participants_field.value).strip() or " ".join(f"<@{u}>" for u in uids)
-        try:
-            start_dt = datetime.fromisoformat(f"{date_str}T{start_str}")
-            end_dt = datetime.fromisoformat(f"{date_str}T{end_str}")
-        except Exception:
+
+        start_date = parse_date_ddmmyyyy(start_date_str)
+        end_date = parse_date_ddmmyyyy(end_date_str)
+        start_time = parse_time_hhmm(start_time_str)
+        end_time = parse_time_hhmm(end_time_str)
+
+        if not start_date or not end_date or not start_time or not end_time:
             try:
-                y,m,d = map(int, date_str.split("-"))
-                sh, sm = map(int, start_str.split(":"))
-                eh, em = map(int, end_str.split(":"))
-                tz = ZoneInfo(POST_TIMEZONE)
-                start_dt = datetime(y, m, d, sh, sm, tzinfo=tz)
-                end_dt = datetime(y, m, d, eh, em, tzinfo=tz)
+                await interaction.response.send_message("Datum/Uhrzeit konnte nicht geparst. Bitte benutze DD.MM.YYYY und HH:MM.", ephemeral=True)
             except Exception:
-                try:
-                    await interaction.response.send_message("Datum/Uhrzeit konnte nicht geparst. Bitte benutze YYYY-MM-DD und HH:MM.", ephemeral=True)
-                except Exception:
-                    pass
-                return
+                pass
+            return
+
+        tz = ZoneInfo(POST_TIMEZONE)
+        start_dt = datetime(start_date.year, start_date.month, start_date.day, start_time.hour, start_time.minute, tzinfo=tz)
+        end_dt = datetime(end_date.year, end_date.month, end_date.day, end_time.hour, end_time.minute, tzinfo=tz)
+
         tmp_storage = create_event_temp_storage.setdefault(self.tmp_key, {})
         tmp_storage.update({
             "title": title,
@@ -727,9 +751,10 @@ class CreateEventModal(discord.ui.Modal):
         view = FinalizeEventView(self.tmp_key, interaction.user.id)
         summary_lines = [
             f"**Titel:** {title}",
-            f"**Datum:** {start_dt.date().isoformat()}",
-            f"**Beginn:** {start_dt.time().strftime('%H:%M')}",
-            f"**Ende:** {end_dt.time().strftime('%H:%M')}",
+            f"**Startdatum:** {start_date.strftime('%d.%m.%Y')}",
+            f"**Beginn:** {start_time.strftime('%H:%M')}",
+            f"**Enddatum:** {end_date.strftime('%d.%m.%Y')}",
+            f"**Ende:** {end_time.strftime('%H:%M')}",
             f"**Teilnehmende:** {participants_text or '—'}",
         ]
         try:
@@ -822,21 +847,26 @@ class FinalizeEventView(discord.ui.View):
             end_dt = datetime.fromisoformat(end_iso) if end_iso else None
         except Exception:
             end_dt = None
+
+        # Build embed with separate date and time fields (no parentheses/zone)
         embed = discord.Embed(title=f"📣 {title}", description=description or "", color=discord.Color.orange(), timestamp=datetime.now(timezone.utc))
         if start_dt:
             try:
-                embed.add_field(name="Start", value=start_dt.astimezone(ZoneInfo(POST_TIMEZONE)).strftime("%d.%m.%Y %H:%M %Z"), inline=False)
+                embed.add_field(name="Startdatum", value=start_dt.strftime("%d.%m.%Y"), inline=True)
+                embed.add_field(name="Beginn", value=start_dt.strftime("%H:%M"), inline=True)
             except Exception:
                 embed.add_field(name="Start", value=str(start_dt), inline=False)
         if end_dt:
             try:
-                embed.add_field(name="Ende", value=end_dt.astimezone(ZoneInfo(POST_TIMEZONE)).strftime("%d.%m.%Y %H:%M %Z"), inline=False)
+                embed.add_field(name="Enddatum", value=end_dt.strftime("%d.%m.%Y"), inline=True)
+                embed.add_field(name="Ende", value=end_dt.strftime("%H:%M"), inline=True)
             except Exception:
                 embed.add_field(name="Ende", value=str(end_dt), inline=False)
         if participants_text:
             embed.add_field(name="Teilnehmende", value=participants_text, inline=False)
         if location:
             embed.add_field(name="Ort", value=location, inline=False)
+
         view = EventSignupView(event_id)
         try:
             bot.add_view(view)
@@ -926,13 +956,15 @@ async def build_created_event_embed(event_id: str, guild: Optional[discord.Guild
     if start_iso:
         try:
             dt = datetime.fromisoformat(start_iso)
-            embed.add_field(name="Start", value=dt.astimezone(ZoneInfo(POST_TIMEZONE)).strftime("%d.%m.%Y %H:%M %Z"), inline=False)
+            embed.add_field(name="Startdatum", value=dt.strftime("%d.%m.%Y"), inline=True)
+            embed.add_field(name="Beginn", value=dt.strftime("%H:%M"), inline=True)
         except Exception:
             embed.add_field(name="Start", value=start_iso, inline=False)
     if end_iso:
         try:
             dt = datetime.fromisoformat(end_iso)
-            embed.add_field(name="Ende", value=dt.astimezone(ZoneInfo(POST_TIMEZONE)).strftime("%d.%m.%Y %H:%M %Z"), inline=False)
+            embed.add_field(name="Enddatum", value=dt.strftime("%d.%m.%Y"), inline=True)
+            embed.add_field(name="Ende", value=dt.strftime("%H:%M"), inline=True)
         except Exception:
             embed.add_field(name="Ende", value=end_iso, inline=False)
     if participants_text:
@@ -949,7 +981,7 @@ async def build_created_event_embed(event_id: str, guild: Optional[discord.Guild
     return embed
 
 # -------------------------
-# PollView & PollButton (defined after all dependency classes above)
+# PollView & PollButton (defined after all dependency classes)
 # -------------------------
 class PollButton(discord.ui.Button):
     def __init__(self, poll_id: str, option_id: int, option_text: str):
@@ -983,11 +1015,11 @@ class PollView(discord.ui.View):
             self.add_item(PollButton(poll_id, opt_id, opt_text))
         # Buttons in requested order and style
         self.add_item(AddOptionButton(poll_id))          # green
-        self.add_item(AddAvailabilityButton(poll_id))    # defined earlier
-        self.add_item(CreateEventButton(poll_id))        # green calendar
-        self.add_item(OpenEditOwnIdeasButton(poll_id))   # gear
+        self.add_item(AddAvailabilityButton(poll_id))    # availability (green)
+        self.add_item(CreateEventButton(poll_id))        # event create (green calendar)
+        self.add_item(OpenEditOwnIdeasButton(poll_id))   # gear button
 
-# AddAvailabilityButton is implemented here (after AvailabilityDayView and its buttons above)
+# AddAvailabilityButton is defined after AvailabilityDayView section above, but we reference it here; define now to ensure name exists.
 class AddAvailabilityButton(discord.ui.Button):
     def __init__(self, poll_id: str):
         super().__init__(label="🕓 Verfügbarkeit hinzufügen", style=discord.ButtonStyle.success, custom_id=f"avail:{poll_id}")
@@ -997,7 +1029,7 @@ class AddAvailabilityButton(discord.ui.Button):
             view = AvailabilityDayView(self.poll_id, day_index=0, for_user=interaction.user.id)
             embed = discord.Embed(
                 title="🕓 Verfügbarkeit auswählen",
-                description="Wähle Stunden für den angezeigten Tag (Mo.–So.). Nach Auswahl: Absenden.",
+                description="Wähle Stunden für den angezeigten Tag (Mo.–So.).",
                 color=discord.Color.green(),
                 timestamp=datetime.now(timezone.utc)
             )
@@ -1146,9 +1178,7 @@ async def listpolls(ctx, limit: int = 50):
     else:
         await ctx.send(f"Polls:\n{text}")
 
-# -------------------------
-# Daily summary & scheduler helpers
-# -------------------------
+# Daily summary helpers
 def get_last_daily_summary(channel_id: int):
     rows = db_execute("SELECT message_id FROM daily_summaries WHERE channel_id = ?", (channel_id,), fetch=True)
     return rows[0][0] if rows and rows[0][0] is not None else None
@@ -1250,7 +1280,7 @@ async def post_daily_summary_to(channel: discord.TextChannel):
         log.exception("Failed saving daily summary id")
 
 # -------------------------
-# Scheduler & startup helpers
+# Scheduler helpers & startup
 # -------------------------
 def job_post_weekly():
     asyncio.create_task(job_post_weekly_coro())
@@ -1318,9 +1348,7 @@ async def on_ready():
     except Exception:
         log.exception("Failed to schedule persistent view registration on startup.")
 
-# -------------------------
 # Entrypoint
-# -------------------------
 if __name__ == "__main__":
     if not BOT_TOKEN:
         print("Bitte BOT_TOKEN als Umgebungsvariable setzen.")
