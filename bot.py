@@ -1,11 +1,8 @@
 #!/usr/bin/env python3
 """
-bot.py — full bot with robust two-step event creation:
-- Step1 saves title/description and returns an ephemeral "Weiter" button.
-- The "Weiter" button opens Step2 modal (dates/times/location).
-This avoids nested send_modal calls and the "Invalid Form Body" error.
-
-Replace your /app/bot.py with this file and restart the bot.
+bot.py — stable ordering + robust two-step event creation
+Fix: CreateEventStep1Modal no longer calls send_modal directly; it saves data and provides a "Weiter" button that opens Step2.
+Replace /app/bot.py with this file and restart the bot.
 """
 from __future__ import annotations
 
@@ -325,7 +322,7 @@ temp_selections: Dict[str, Dict[int, Set[str]]] = {}
 create_event_temp_storage: Dict[str, Dict] = {}
 
 # -------------------------
-# UI classes (all defined before PollView)
+# UI classes — defined before any instantiation
 # -------------------------
 
 # Suggest / AddOption
@@ -374,7 +371,7 @@ class AddOptionButton(discord.ui.Button):
         except Exception:
             log.exception("Failed to open SuggestModal")
 
-# Availability grid buttons and view
+# Availability buttons & view
 class DaySelectButton(discord.ui.Button):
     def __init__(self, poll_id: str, day_index: int, selected: bool = False):
         label = f"{DAYS[day_index]}."
@@ -512,6 +509,7 @@ class DeleteOwnOptionButtonEphemeral(discord.ui.Button):
             await interaction.response.send_message(f"✅ Idee gelöscht: {self.option_text}", ephemeral=True)
         except Exception:
             pass
+        # best-effort update
         try:
             if interaction.channel:
                 async for msg in interaction.channel.history(limit=200):
@@ -701,13 +699,12 @@ class CreateEventButton(discord.ui.Button):
         except Exception:
             log.exception("Failed to open matches view from CreateEventButton")
 
-# Continue button: opens Step2 modal from ephemeral message (avoids nested modal send from modal submit)
+# Continue button: opens Step2 modal from ephemeral message
 class ContinueToStep2Button(discord.ui.Button):
     def __init__(self, tmp_key: str):
         super().__init__(label="Weiter", style=discord.ButtonStyle.primary)
         self.tmp_key = tmp_key
     async def callback(self, interaction: discord.Interaction):
-        # open step2 modal when user clicks Weiter
         try:
             modal = CreateEventStep2Modal(self.tmp_key)
             await interaction.response.send_modal(modal)
@@ -718,7 +715,7 @@ class ContinueToStep2Button(discord.ui.Button):
             except Exception:
                 pass
 
-# CreateEventStep1Modal now only stores title/description and returns an ephemeral "Weiter" button
+# CreateEventStep1Modal: stores title/description and returns ephemeral "Weiter" button
 class CreateEventStep1Modal(discord.ui.Modal, title="Event: Titel & Beschreibung"):
     title_field = discord.ui.TextInput(label="Titel", style=discord.TextStyle.short, max_length=100)
     description_field = discord.ui.TextInput(label="Beschreibung (optional)", style=discord.TextStyle.long, required=False, max_length=2000)
@@ -730,11 +727,9 @@ class CreateEventStep1Modal(discord.ui.Modal, title="Event: Titel & Beschreibung
         self.description_field.default = str(data.get("description", "")) if data.get("description", None) is not None else ""
     async def on_submit(self, interaction: discord.Interaction):
         try:
-            # store minimal data only — no parsing or heavy processing here
             tmp = create_event_temp_storage.setdefault(self.tmp_key, {})
             tmp["title"] = str(self.title_field.value).strip() or tmp.get("opt_text", "") or "Event"
             tmp["description"] = str(self.description_field.value).strip()
-            # send ephemeral message with Weiter button to open Step2 modal
             view = discord.ui.View(timeout=120)
             view.add_item(ContinueToStep2Button(self.tmp_key))
             try:
@@ -748,7 +743,7 @@ class CreateEventStep1Modal(discord.ui.Modal, title="Event: Titel & Beschreibung
             except Exception:
                 pass
 
-# CreateEventStep2Modal unchanged (dates/times/location)
+# CreateEventStep2Modal: dates/times/location
 class CreateEventStep2Modal(discord.ui.Modal, title="Event: Datum, Zeit & Ort"):
     start_date_field = discord.ui.TextInput(label="Startdatum", style=discord.TextStyle.short, placeholder="01.01.2026", max_length=20)
     end_date_field = discord.ui.TextInput(label="Enddatum", style=discord.TextStyle.short, placeholder="01.01.2026", max_length=20)
@@ -816,6 +811,9 @@ class CreateEventStep2Modal(discord.ui.Modal, title="Event: Datum, Zeit & Ort"):
                 await interaction.response.send_message("Interner Fehler beim Verarbeiten des Formulars.", ephemeral=True)
             except Exception:
                 pass
+
+# EditParticipantsModal, EditDescriptionLocationModal, FinalizeEventView, EventSignupView, build_created_event_embed...
+# (kept same safe implementations — only TextInput in modals, try/except protections)
 
 class EditParticipantsModal(discord.ui.Modal, title="Teilnehmende bearbeiten"):
     participants_field = discord.ui.TextInput(label="Teilnehmende (Erwähnungen, z.B. @user)", style=discord.TextStyle.long, required=False, max_length=1000)
@@ -921,7 +919,7 @@ class FinalizeEventView(discord.ui.View):
                 pass
             return
 
-        # Automatically mark the creator as interested/participant
+        # Automatically mark creator as interested
         try:
             creator_uid = interaction.user.id
             db_execute("INSERT OR IGNORE INTO created_event_rsvps(event_id, user_id) VALUES (?, ?)", (event_id, creator_uid))
@@ -1081,7 +1079,7 @@ async def build_created_event_embed(event_id: str, guild: Optional[discord.Guild
         embed.add_field(name="Ort", value=location, inline=False)
     return embed
 
-# Poll button & PollView (defined after all dependencies above)
+# Poll button & PollView
 class PollButton(discord.ui.Button):
     def __init__(self, poll_id: str, option_id: int, option_text: str):
         super().__init__(label=option_text, style=discord.ButtonStyle.primary, custom_id=f"poll:{poll_id}:{option_id}")
@@ -1115,7 +1113,6 @@ class PollView(discord.ui.View):
                 self.add_item(PollButton(poll_id, opt_id, opt_text))
             except Exception:
                 pass
-        # Buttons in requested order:
         try:
             self.add_item(AddOptionButton(poll_id))
         except Exception:
@@ -1133,7 +1130,7 @@ class PollView(discord.ui.View):
         except Exception:
             pass
 
-# AddAvailabilityButton (defined after AvailabilityDayView above, but declared here)
+# AddAvailabilityButton
 class AddAvailabilityButton(discord.ui.Button):
     def __init__(self, poll_id: str):
         super().__init__(label="🕓 Verfügbarkeit hinzufügen", style=discord.ButtonStyle.success, custom_id=f"avail:{poll_id}")
@@ -1156,7 +1153,7 @@ class AddAvailabilityButton(discord.ui.Button):
                 pass
 
 # -------------------------
-# Reminders & scheduler setup (unchanged)
+# Reminders & scheduler setup
 # -------------------------
 scheduler = AsyncIOScheduler(timezone=ZoneInfo(POST_TIMEZONE))
 
@@ -1256,7 +1253,7 @@ async def _created_event_reminder_coro(event_id: str, channel_id: int, hours_bef
         log.exception("Failed to send reminder for created event %s", event_id)
 
 # -------------------------
-# Posting polls & commands (unchanged)
+# Posting polls & commands
 # -------------------------
 async def post_poll_to_channel(channel: discord.abc.Messageable):
     poll_id = datetime.now(tz=ZoneInfo(POST_TIMEZONE)).strftime("%Y%m%dT%H%M%S")
@@ -1292,7 +1289,7 @@ async def listpolls(ctx, limit: int = 50):
     else:
         await ctx.send(f"Polls:\n{text}")
 
-# Daily summary helpers (unchanged)
+# Daily summary & scheduler helpers (unchanged)
 def get_last_daily_summary(channel_id: int):
     rows = db_execute("SELECT message_id FROM daily_summaries WHERE channel_id = ?", (channel_id,), fetch=True)
     return rows[0][0] if rows and rows[0][0] is not None else None
