@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
 """
-bot.py — stable ordering + robust two-step event creation
-Fix: CreateEventStep1Modal no longer calls send_modal directly; it saves data and provides a "Weiter" button that opens Step2.
-Replace /app/bot.py with this file and restart the bot.
+bot.py — Event creation: Step1 -> directly opens Step2 modal (no extra click).
+Tries to use native Date/Time pickers if available at runtime; falls nicht, TextInput fallback (DD.MM.YYYY, HH:MM).
+Keeps previous behaviors: silent availability save, Startdatum/Enddatum fields etc.
+
+Replace your running bot.py with this file and restart the bot.
 """
 from __future__ import annotations
 
@@ -322,7 +324,7 @@ temp_selections: Dict[str, Dict[int, Set[str]]] = {}
 create_event_temp_storage: Dict[str, Dict] = {}
 
 # -------------------------
-# UI classes — defined before any instantiation
+# UI classes (defined before use)
 # -------------------------
 
 # Suggest / AddOption
@@ -340,8 +342,8 @@ class SuggestModal(discord.ui.Modal, title="Neue Idee hinzufügen"):
                 pass
             return
         add_option(self.poll_id, text, author_id=interaction.user.id)
-        # best-effort update of poll message in this channel
         try:
+            # best-effort update nearby poll message
             if interaction.channel:
                 async for msg in interaction.channel.history(limit=200):
                     if msg.author == bot.user and msg.embeds:
@@ -355,7 +357,7 @@ class SuggestModal(discord.ui.Modal, title="Neue Idee hinzufügen"):
                             await msg.edit(embed=embed, view=PollView(self.poll_id))
                             break
         except Exception:
-            log.exception("Best-effort update of poll message failed")
+            log.exception("Best-effort update failed")
         try:
             await interaction.response.defer(ephemeral=True)
         except Exception:
@@ -371,7 +373,7 @@ class AddOptionButton(discord.ui.Button):
         except Exception:
             log.exception("Failed to open SuggestModal")
 
-# Availability buttons & view
+# Availability grid and controls
 class DaySelectButton(discord.ui.Button):
     def __init__(self, poll_id: str, day_index: int, selected: bool = False):
         label = f"{DAYS[day_index]}."
@@ -457,13 +459,11 @@ class AvailabilityDayView(discord.ui.View):
             if for_user not in pst:
                 persisted = db_execute("SELECT slot FROM availability WHERE poll_id = ? AND user_id = ?", (poll_id, for_user), fetch=True)
                 pst[for_user] = set(r[0] for r in persisted)
-        # day selector
         day_rows = (len(DAYS) + 5 - 1) // 5
         for idx in range(len(DAYS)):
             btn = DaySelectButton(poll_id, idx, selected=(idx == day_index))
             btn.row = idx // 5
             self.add_item(btn)
-        # hour buttons
         day = DAYS[day_index]
         uid = for_user
         user_temp = temp_selections.get(poll_id, {}).get(uid, set())
@@ -509,7 +509,6 @@ class DeleteOwnOptionButtonEphemeral(discord.ui.Button):
             await interaction.response.send_message(f"✅ Idee gelöscht: {self.option_text}", ephemeral=True)
         except Exception:
             pass
-        # best-effort update
         try:
             if interaction.channel:
                 async for msg in interaction.channel.history(limit=200):
@@ -570,7 +569,7 @@ class OpenEditOwnIdeasButton(discord.ui.Button):
         except Exception:
             pass
 
-# Event creation UI (match selection / modal)
+# Event creation: Match/New buttons and direct Step1->Step2 flow
 class MatchButton(discord.ui.Button):
     def __init__(self, poll_id: str, matches_key: str, index: int):
         super().__init__(label=f"Wähle {index+1}", style=discord.ButtonStyle.primary)
@@ -699,23 +698,7 @@ class CreateEventButton(discord.ui.Button):
         except Exception:
             log.exception("Failed to open matches view from CreateEventButton")
 
-# Continue button: opens Step2 modal from ephemeral message
-class ContinueToStep2Button(discord.ui.Button):
-    def __init__(self, tmp_key: str):
-        super().__init__(label="Weiter", style=discord.ButtonStyle.primary)
-        self.tmp_key = tmp_key
-    async def callback(self, interaction: discord.Interaction):
-        try:
-            modal = CreateEventStep2Modal(self.tmp_key)
-            await interaction.response.send_modal(modal)
-        except Exception:
-            log.exception("Failed to open CreateEvent Step2 modal from ContinueToStep2Button")
-            try:
-                await interaction.response.send_message("Fehler beim Öffnen des nächsten Schritts.", ephemeral=True)
-            except Exception:
-                pass
-
-# CreateEventStep1Modal: stores title/description and returns ephemeral "Weiter" button
+# CreateEventStep1Modal: on_submit now directly opens Step2 modal (no intermediate ephemeral)
 class CreateEventStep1Modal(discord.ui.Modal, title="Event: Titel & Beschreibung"):
     title_field = discord.ui.TextInput(label="Titel", style=discord.TextStyle.short, max_length=100)
     description_field = discord.ui.TextInput(label="Beschreibung (optional)", style=discord.TextStyle.long, required=False, max_length=2000)
@@ -730,12 +713,17 @@ class CreateEventStep1Modal(discord.ui.Modal, title="Event: Titel & Beschreibung
             tmp = create_event_temp_storage.setdefault(self.tmp_key, {})
             tmp["title"] = str(self.title_field.value).strip() or tmp.get("opt_text", "") or "Event"
             tmp["description"] = str(self.description_field.value).strip()
-            view = discord.ui.View(timeout=120)
-            view.add_item(ContinueToStep2Button(self.tmp_key))
+            # Directly open Step2 modal. This may raise on some library/client combos;
+            # we catch exceptions and fallback to ephemeral info if needed.
+            modal = create_step2_modal_instance(self.tmp_key)
             try:
-                await interaction.response.send_message("Titel und Beschreibung gespeichert. Klicke auf Weiter, um Datum & Zeit einzugeben.", view=view, ephemeral=True)
+                await interaction.response.send_modal(modal)
             except Exception:
-                log.exception("Failed to send ephemeral Continue message after Step1 submit")
+                log.exception("Failed to open CreateEvent Step2 modal directly from Step1")
+                try:
+                    await interaction.response.send_message("Fehler beim Öffnen des nächsten Schritts. Bitte versuche es erneut.", ephemeral=True)
+                except Exception:
+                    pass
         except Exception:
             log.exception("Unhandled error in CreateEventStep1Modal.on_submit")
             try:
@@ -743,8 +731,8 @@ class CreateEventStep1Modal(discord.ui.Modal, title="Event: Titel & Beschreibung
             except Exception:
                 pass
 
-# CreateEventStep2Modal: dates/times/location
-class CreateEventStep2Modal(discord.ui.Modal, title="Event: Datum, Zeit & Ort"):
+# TextInput-based Step2 modal (fallback)
+class CreateEventStep2Modal_TextInput(discord.ui.Modal, title="Event: Datum, Zeit & Ort"):
     start_date_field = discord.ui.TextInput(label="Startdatum", style=discord.TextStyle.short, placeholder="01.01.2026", max_length=20)
     end_date_field = discord.ui.TextInput(label="Enddatum", style=discord.TextStyle.short, placeholder="01.01.2026", max_length=20)
     start_field = discord.ui.TextInput(label="Beginn", style=discord.TextStyle.short, placeholder="18:00", max_length=8)
@@ -806,15 +794,145 @@ class CreateEventStep2Modal(discord.ui.Modal, title="Event: Datum, Zeit & Ort"):
             except Exception:
                 log.exception("Failed to send event draft after Step2 submit")
         except Exception:
-            log.exception("Unhandled error in CreateEventStep2Modal.on_submit")
+            log.exception("Unhandled error in CreateEventStep2Modal_TextInput.on_submit")
             try:
                 await interaction.response.send_message("Interner Fehler beim Verarbeiten des Formulars.", ephemeral=True)
             except Exception:
                 pass
 
-# EditParticipantsModal, EditDescriptionLocationModal, FinalizeEventView, EventSignupView, build_created_event_embed...
-# (kept same safe implementations — only TextInput in modals, try/except protections)
+# Factory that attempts to build a native Date/Time modal if supported; otherwise returns TextInput modal instance.
+def create_step2_modal_instance(tmp_key: str) -> discord.ui.Modal:
+    """
+    Tries to construct a modal using native Date/Time pickers if available in the runtime discord.ui.
+    Falls back to CreateEventStep2Modal_TextInput.
+    """
+    DatePicker = getattr(discord.ui, "DatePicker", None) or getattr(discord.ui, "DateSelect", None)
+    TimePicker = getattr(discord.ui, "TimePicker", None) or getattr(discord.ui, "TimeSelect", None)
+    if DatePicker is not None:
+        try:
+            # Attempt to dynamically construct a Modal with native pickers.
+            # The exact constructor signature for native pickers may vary across libraries;
+            # we wrap in try/except and fall back on failure.
+            class CreateEventStep2Modal_Native(discord.ui.Modal, title="Event: Datum, Zeit & Ort"):
+                # try to instantiate native picker components; if signature differs, this will raise and be caught.
+                start_date = DatePicker(label="Startdatum")
+                end_date = DatePicker(label="Enddatum")
+                # For time, if there's a TimePicker/TimeSelect, use it; otherwise omit and rely on text fallback below.
+                if TimePicker is not None:
+                    start_time = TimePicker(label="Beginn")
+                    end_time = TimePicker(label="Ende")
+                else:
+                    # fallback single-line text fields for times
+                    start_time = discord.ui.TextInput(label="Beginn", style=discord.TextStyle.short, placeholder="18:00", max_length=8)
+                    end_time = discord.ui.TextInput(label="Ende", style=discord.TextStyle.short, placeholder="20:00", max_length=8)
+                location_field = discord.ui.TextInput(label="Ort", style=discord.TextStyle.short, required=False, max_length=200)
+                def __init__(self, tmp_key_inner: str):
+                    super().__init__(title="Event: Datum, Zeit & Ort")
+                    self.tmp_key = tmp_key_inner
+                    data = create_event_temp_storage.get(tmp_key_inner, {})
+                    # If pickers provide a default-setting API, we'd set defaults here — unknown across libs, so skip.
+                async def on_submit(self, interaction: discord.Interaction):
+                    try:
+                        tmp = create_event_temp_storage.setdefault(self.tmp_key, {})
+                        # read values from pickers/text inputs; names depend on picker classes
+                        # Use safe getattr and parsing fallback.
+                        # start_date_val = getattr(self, 'start_date').value or None
+                        try:
+                            sd_comp = getattr(self, 'start_date', None)
+                            if sd_comp is not None:
+                                # many picker components expose .value as datetime.date
+                                sd_val = getattr(sd_comp, "value", None)
+                                if isinstance(sd_val, date):
+                                    start_date = sd_val
+                                else:
+                                    start_date = None
+                            else:
+                                start_date = None
+                        except Exception:
+                            start_date = None
+                        try:
+                            ed_comp = getattr(self, 'end_date', None)
+                            if ed_comp is not None:
+                                ed_val = getattr(ed_comp, "value", None)
+                                if isinstance(ed_val, date):
+                                    end_date = ed_val
+                                else:
+                                    end_date = None
+                            else:
+                                end_date = None
+                        except Exception:
+                            end_date = None
+                        # times: if native time pickers exist, attempt to read; otherwise read text fields
+                        start_time = None
+                        end_time = None
+                        try:
+                            st_comp = getattr(self, 'start_time', None)
+                            if st_comp is not None:
+                                st_val = getattr(st_comp, "value", None)
+                                if isinstance(st_val, _time):
+                                    start_time = st_val
+                                elif isinstance(st_val, str):
+                                    start_time = parse_time_hhmm(st_val)
+                                else:
+                                    start_time = None
+                        except Exception:
+                            start_time = None
+                        try:
+                            et_comp = getattr(self, 'end_time', None)
+                            if et_comp is not None:
+                                et_val = getattr(et_comp, "value", None)
+                                if isinstance(et_val, _time):
+                                    end_time = et_val
+                                elif isinstance(et_val, str):
+                                    end_time = parse_time_hhmm(et_val)
+                                else:
+                                    end_time = None
+                        except Exception:
+                            end_time = None
+                        # If any of these are None, fall back to ephemeral error
+                        if not start_date or not end_date or not start_time or not end_time:
+                            try:
+                                await interaction.response.send_message("Datum/Uhrzeit konnte nicht geparst (native picker). Bitte benutze das erwartete Format.", ephemeral=True)
+                            except Exception:
+                                log.exception("Failed to send invalid-date message for native modal")
+                            return
+                        tz = ZoneInfo(POST_TIMEZONE)
+                        start_dt = datetime(start_date.year, start_date.month, start_date.day, start_time.hour, start_time.minute, tzinfo=tz)
+                        end_dt = datetime(end_date.year, end_date.month, end_date.day, end_time.hour, end_time.minute, tzinfo=tz)
+                        tmp.update({
+                            "start_dt": start_dt.isoformat(),
+                            "end_dt": end_dt.isoformat(),
+                            "location": getattr(self, 'location_field').value.strip() if getattr(self, 'location_field', None) else tmp.get("default_location", ""),
+                            "participants_text": tmp.get("participants_text", tmp.get("mentions", "")),
+                        })
+                        view = FinalizeEventView(self.tmp_key, interaction.user.id)
+                        summary_lines = [
+                            f"**Titel:** {tmp.get('title')}",
+                            f"**Startdatum:** {start_dt.strftime('%d.%m.%Y')}",
+                            f"**Beginn:** {start_dt.strftime('%H:%M')}",
+                            f"**Enddatum:** {end_dt.strftime('%d.%m.%Y')}",
+                            f"**Ende:** {end_dt.strftime('%H:%M')}",
+                            f"**Ort:** {tmp.get('location') or '—'}",
+                            f"**Teilnehmende:** {tmp.get('participants_text') or '—'}",
+                        ]
+                        try:
+                            await interaction.response.send_message("Event-Entwurf:\n" + "\n".join(summary_lines), view=view, ephemeral=True)
+                        except Exception:
+                            log.exception("Failed to send event draft after native Step2 submit")
+                    except Exception:
+                        log.exception("Unhandled error in CreateEventStep2Modal_Native.on_submit")
+                        try:
+                            await interaction.response.send_message("Interner Fehler beim Verarbeiten des Formulars.", ephemeral=True)
+                        except Exception:
+                            pass
+            # If constructing dynamic class succeeded, return an instance
+            return CreateEventStep2Modal_Native(tmp_key)
+        except Exception:
+            log.exception("Failed building native Step2 modal; falling back to TextInput modal")
+    # fallback
+    return CreateEventStep2Modal_TextInput(tmp_key)
 
+# EditParticipantsModal, EditDescriptionLocationModal, FinalizeEventView, EventSignupView, build_created_event_embed etc.
 class EditParticipantsModal(discord.ui.Modal, title="Teilnehmende bearbeiten"):
     participants_field = discord.ui.TextInput(label="Teilnehmende (Erwähnungen, z.B. @user)", style=discord.TextStyle.long, required=False, max_length=1000)
     def __init__(self, tmp_key: str):
@@ -919,7 +1037,7 @@ class FinalizeEventView(discord.ui.View):
                 pass
             return
 
-        # Automatically mark creator as interested
+        # automatically add creator as interested
         try:
             creator_uid = interaction.user.id
             db_execute("INSERT OR IGNORE INTO created_event_rsvps(event_id, user_id) VALUES (?, ?)", (event_id, creator_uid))
@@ -1019,7 +1137,7 @@ class EventSignupView(discord.ui.View):
                 await interaction.response.send_message("Fehler beim Verarbeiten deiner Anmeldung.", ephemeral=True)
             except Exception:
                 pass
-        # update posted message (best-effort)
+        # best-effort update of posted event message
         try:
             rows = db_execute("SELECT posted_channel_id, posted_message_id FROM created_events WHERE id = ?", (self.event_id,), fetch=True) or []
             if rows:
@@ -1153,7 +1271,7 @@ class AddAvailabilityButton(discord.ui.Button):
                 pass
 
 # -------------------------
-# Reminders & scheduler setup
+# Reminders, posting, scheduling, commands (unchanged flow)
 # -------------------------
 scheduler = AsyncIOScheduler(timezone=ZoneInfo(POST_TIMEZONE))
 
@@ -1252,9 +1370,7 @@ async def _created_event_reminder_coro(event_id: str, channel_id: int, hours_bef
     except Exception:
         log.exception("Failed to send reminder for created event %s", event_id)
 
-# -------------------------
 # Posting polls & commands
-# -------------------------
 async def post_poll_to_channel(channel: discord.abc.Messageable):
     poll_id = datetime.now(tz=ZoneInfo(POST_TIMEZONE)).strftime("%Y%m%dT%H%M%S")
     create_poll_record(poll_id)
@@ -1289,7 +1405,7 @@ async def listpolls(ctx, limit: int = 50):
     else:
         await ctx.send(f"Polls:\n{text}")
 
-# Daily summary & scheduler helpers (unchanged)
+# Daily summary & scheduler helpers
 def get_last_daily_summary(channel_id: int):
     rows = db_execute("SELECT message_id FROM daily_summaries WHERE channel_id = ?", (channel_id,), fetch=True)
     return rows[0][0] if rows and rows[0][0] is not None else None
@@ -1390,9 +1506,7 @@ async def post_daily_summary_to(channel: discord.TextChannel):
     except Exception:
         log.exception("Failed saving daily summary id")
 
-# -------------------------
 # Scheduler helpers & startup
-# -------------------------
 def job_post_weekly():
     asyncio.create_task(job_post_weekly_coro())
 
@@ -1459,7 +1573,6 @@ async def on_ready():
     except Exception:
         log.exception("Failed to schedule persistent view registration on startup.")
 
-# Entrypoint
 if __name__ == "__main__":
     if not BOT_TOKEN:
         print("Bitte BOT_TOKEN als Umgebungsvariable setzen.")
