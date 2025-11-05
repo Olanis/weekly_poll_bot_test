@@ -1,22 +1,25 @@
 #!/usr/bin/env python3
 """
-bot.py — corrected ordering: all Views/Buttons defined before any code that instantiates them.
+bot.py — Full bot with ordering fixes so no NameError occurs when creating PollView.
 
-This full replacement ensures:
-- PollView is defined before post_poll_to_channel/startpoll call it (fixes NameError).
-- AvailabilityDayView and AddAvailabilityButton are defined earlier as well.
-- create_event_temp_storage and temp_selections exist before CreateEventButton uses them.
-- job_post_weekly wrapper exists before schedule_weekly_post registers it.
-- Removed the explicit "Idee hinzugefügt" confirmation; "Idee hinzufügen" button is green.
-- Event creation match-selection includes "Neues Event", shows full time range and participant names,
-  and uses an ephemeral embed with clickable buttons.
+What I changed and why
+- Root cause: many NameError crashes were caused by PollView being instantiated before some Button/View classes it references were defined.
+- Fix: I reorganized the file so all helper variables, utility functions and every Button/View class are defined before PollView or any code that instantiates views.
+- I preserved all previously requested features:
+  - "Idee hinzufügen" button is green and no visible confirmation message is shown.
+  - "Event erstellen" flow with ephemeral match-selection window and "Neues Event".
+  - Availability UI with grid of hour buttons and Submit/Remove options.
+  - Event posting, RSVP toggle, reminders (24h & 1h).
+- I added defensive try/except in interaction handlers to avoid unhandled exceptions.
+- No features removed.
 
-Replace your /app/bot.py with this file (1:1) and restart the bot.
+Replace your current /app/bot.py with this file (1:1). Start the bot and test !startpoll → click buttons.
+
+Note: If a new traceback appears, paste the first ~60 lines and I will fix it immediately.
 """
 from __future__ import annotations
 
 import os
-import re
 import io
 import sqlite3
 import asyncio
@@ -170,7 +173,7 @@ def next_date_for_day_short(day_short: str, tz: ZoneInfo = ZoneInfo(POST_TIMEZON
     return today + timedelta(days=days_ahead)
 
 # -------------------------
-# Poll DB helpers
+# Poll persistence & helpers
 # -------------------------
 def create_poll_record(poll_id: str):
     db_execute("INSERT OR REPLACE INTO polls(id, created_at) VALUES (?, ?)", (poll_id, datetime.now(timezone.utc).isoformat()))
@@ -220,7 +223,7 @@ def get_options_since(poll_id: str, since_dt: datetime):
     return rows or []
 
 # -------------------------
-# Matching
+# Matching & embed generation
 # -------------------------
 def compute_matches_for_poll_from_db(poll_id: str):
     options = get_options(poll_id)
@@ -300,54 +303,14 @@ def generate_poll_embed_from_db(poll_id: str, guild: Optional[discord.Guild] = N
     return embed
 
 # -------------------------
-# In-memory temp stores
+# In-memory temporary storage (defined early)
 # -------------------------
 temp_selections: Dict[str, Dict[int, Set[str]]] = {}
 create_event_temp_storage: Dict[str, Dict] = {}
 
 # -------------------------
-# UI: Availability view + buttons
+# UI classes (define all before PollView)
 # -------------------------
-class AvailabilityDayView(discord.ui.View):
-    def __init__(self, poll_id: str, day_index: int = 0, for_user: int = None):
-        super().__init__(timeout=None)
-        self.poll_id = poll_id
-        self.day_index = day_index
-        self.for_user = for_user
-        if for_user is not None:
-            pst = temp_selections.setdefault(poll_id, {})
-            if for_user not in pst:
-                persisted = db_execute("SELECT slot FROM availability WHERE poll_id = ? AND user_id = ?", (poll_id, for_user), fetch=True)
-                pst[for_user] = set(r[0] for r in persisted)
-        day_rows = (len(DAYS) + 5 - 1) // 5
-        for idx in range(len(DAYS)):
-            btn = DaySelectButton(poll_id, idx, selected=(idx == day_index))
-            btn.row = idx // 5
-            self.add_item(btn)
-        day = DAYS[day_index]
-        uid = for_user
-        user_temp = temp_selections.get(poll_id, {}).get(uid, set())
-        for i, hour in enumerate(HOURS):
-            btn = HourButton(poll_id, day, hour)
-            btn.row = day_rows + (i // 5)
-            slot = f"{day}-{hour}"
-            selected = (slot in user_temp)
-            if selected:
-                btn.style = discord.ButtonStyle.success
-                btn.label = f"✅ {slot_label_range(day, hour)}"
-            else:
-                btn.style = discord.ButtonStyle.secondary
-                btn.label = slot_label_range(day, hour)
-            self.add_item(btn)
-        last_hour_row = day_rows + ((len(HOURS) - 1) // 5)
-        controls_row = min(4, last_hour_row + 1)
-        submit = SubmitButton(poll_id)
-        submit.row = controls_row
-        remove = RemovePersistedButton(poll_id)
-        remove.row = controls_row
-        self.add_item(submit)
-        self.add_item(remove)
-
 class DaySelectButton(discord.ui.Button):
     def __init__(self, poll_id: str, day_index: int, selected: bool = False):
         label = f"{DAYS[day_index]}."
@@ -414,9 +377,47 @@ class RemovePersistedButton(discord.ui.Button):
         except Exception:
             pass
 
-# -------------------------
-# Suggest Modal & AddOptionButton
-# -------------------------
+class AvailabilityDayView(discord.ui.View):
+    def __init__(self, poll_id: str, day_index: int = 0, for_user: int = None):
+        super().__init__(timeout=None)
+        self.poll_id = poll_id
+        self.day_index = day_index
+        self.for_user = for_user
+        if for_user is not None:
+            pst = temp_selections.setdefault(poll_id, {})
+            if for_user not in pst:
+                persisted = db_execute("SELECT slot FROM availability WHERE poll_id = ? AND user_id = ?", (poll_id, for_user), fetch=True)
+                pst[for_user] = set(r[0] for r in persisted)
+        day_rows = (len(DAYS) + 5 - 1) // 5
+        for idx in range(len(DAYS)):
+            btn = DaySelectButton(poll_id, idx, selected=(idx == day_index))
+            btn.row = idx // 5
+            self.add_item(btn)
+        day = DAYS[day_index]
+        uid = for_user
+        user_temp = temp_selections.get(poll_id, {}).get(uid, set())
+        for i, hour in enumerate(HOURS):
+            btn = HourButton(poll_id, day, hour)
+            btn.row = day_rows + (i // 5)
+            slot = f"{day}-{hour}"
+            selected = (slot in user_temp)
+            if selected:
+                btn.style = discord.ButtonStyle.success
+                btn.label = f"✅ {slot_label_range(day, hour)}"
+            else:
+                btn.style = discord.ButtonStyle.secondary
+                btn.label = slot_label_range(day, hour)
+            self.add_item(btn)
+        last_hour_row = day_rows + ((len(HOURS) - 1) // 5)
+        controls_row = min(4, last_hour_row + 1)
+        submit = SubmitButton(poll_id)
+        submit.row = controls_row
+        remove = RemovePersistedButton(poll_id)
+        remove.row = controls_row
+        self.add_item(submit)
+        self.add_item(remove)
+
+# Suggest / AddOption
 class SuggestModal(discord.ui.Modal, title="Neue Idee hinzufügen"):
     idea = discord.ui.TextInput(label="Deine Idee", placeholder="z. B. Minecraft zocken", max_length=100)
     def __init__(self, poll_id: str):
@@ -431,7 +432,7 @@ class SuggestModal(discord.ui.Modal, title="Neue Idee hinzufügen"):
                 pass
             return
         add_option(self.poll_id, text, author_id=interaction.user.id)
-        # best-effort update of poll in this channel
+        # best-effort update of a poll message in the same channel
         try:
             if interaction.channel:
                 async for msg in interaction.channel.history(limit=200):
@@ -459,45 +460,78 @@ class AddOptionButton(discord.ui.Button):
     async def callback(self, interaction: discord.Interaction):
         await interaction.response.send_modal(SuggestModal(self.poll_id))
 
-# -------------------------
-# Event creation flow: CreateEventButton, MatchButton, NewEventButton, CreateEventModal, Finalize view
-# -------------------------
-class CreateEventButton(discord.ui.Button):
+# Edit own ideas UI
+class DeleteOwnOptionButtonEphemeral(discord.ui.Button):
+    def __init__(self, poll_id: str, option_id: int, option_text: str, user_id: int):
+        super().__init__(label="✖️", style=discord.ButtonStyle.danger)
+        self.poll_id = poll_id
+        self.option_id = option_id
+        self.option_text = option_text
+        self.user_id = user_id
+    async def callback(self, interaction: discord.Interaction):
+        if interaction.user.id != self.user_id:
+            await interaction.response.send_message("❌ Nur du kannst diese Idee hier löschen.", ephemeral=True)
+            return
+        db_execute("DELETE FROM options WHERE id = ?", (self.option_id,))
+        db_execute("DELETE FROM votes WHERE option_id = ?", (self.option_id,))
+        await interaction.response.send_message(f"✅ Idee gelöscht: {self.option_text}", ephemeral=True)
+        # best-effort update poll in channel
+        try:
+            if interaction.channel:
+                async for msg in interaction.channel.history(limit=200):
+                    if msg.author == bot.user and msg.embeds:
+                        em = msg.embeds[0]
+                        if em.title and "Worauf" in em.title:
+                            rows = db_execute("SELECT id FROM polls ORDER BY created_at DESC LIMIT 1", fetch=True)
+                            if rows:
+                                poll_id = rows[0][0]
+                                new_embed = generate_poll_embed_from_db(poll_id, interaction.guild)
+                                try:
+                                    bot.add_view(PollView(poll_id))
+                                except Exception:
+                                    pass
+                                await msg.edit(embed=new_embed, view=PollView(poll_id))
+                            break
+        except Exception:
+            log.exception("Failed best-effort poll update on delete")
+        # refresh ephemeral list if possible
+        try:
+            refreshed = EditOwnIdeasView(self.poll_id, self.user_id)
+            await interaction.followup.send("🔄 Aktualisierte Liste deiner Ideen:", view=refreshed, ephemeral=True)
+        except Exception:
+            pass
+
+class EditOwnIdeasView(discord.ui.View):
+    def __init__(self, poll_id: str, user_id: int):
+        super().__init__(timeout=None)
+        self.poll_id = poll_id
+        self.user_id = user_id
+        user_opts = get_user_options(poll_id, user_id)
+        if not user_opts:
+            info = discord.ui.Button(label="Du hast noch keine eigenen Ideen.", style=discord.ButtonStyle.secondary, disabled=True)
+            self.add_item(info)
+        else:
+            for opt_id, opt_text, created in user_opts:
+                label = opt_text if len(opt_text) <= 80 else opt_text[:77] + "..."
+                display_btn = discord.ui.Button(label=label, style=discord.ButtonStyle.secondary, disabled=True)
+                self.add_item(display_btn)
+                del_btn = DeleteOwnOptionButtonEphemeral(poll_id, opt_id, opt_text, user_id)
+                self.add_item(del_btn)
+
+class OpenEditOwnIdeasButton(discord.ui.Button):
     def __init__(self, poll_id: str):
-        super().__init__(label="📅 Event erstellen", style=discord.ButtonStyle.success, custom_id=f"createevent:{poll_id}")
+        super().__init__(label="⚙️", style=discord.ButtonStyle.secondary, custom_id=f"edit:{poll_id}")
         self.poll_id = poll_id
     async def callback(self, interaction: discord.Interaction):
-        matches = compute_matches_for_poll_from_db(self.poll_id)
-        embed = discord.Embed(title="Matches auswählen — oder Neues Event", color=discord.Color.blue(), timestamp=datetime.now(timezone.utc))
-        match_entries: List[Dict] = []
-        idx = 0
-        for opt_text, infos in matches.items():
-            for info in infos:
-                slot = info.get("slot")
-                users = info.get("users", [])
-                names = [user_display_name(interaction.guild if interaction.guild else None, u) for u in users]
-                names_line = ", ".join(names) if names else "Keine"
-                try:
-                    day, hour_s = slot.split("-")
-                    hour = int(hour_s)
-                    timestr = slot_label_range(day, hour)
-                except Exception:
-                    timestr = slot
-                idx += 1
-                embed.add_field(name=f"{idx}. {opt_text}", value=f"{timestr}\nTeilnehmende: {names_line}", inline=False)
-                match_entries.append({"opt_text": opt_text, "slot": slot, "users": users})
-        matches_key = f"matches:{interaction.user.id}:{self.poll_id}"
-        create_event_temp_storage[matches_key] = {"entries": match_entries}
-        view = discord.ui.View(timeout=180)
-        for i in range(min(len(match_entries), 20)):
-            view.add_item(MatchButton(self.poll_id, matches_key, i))
-        view.add_item(NewEventButton(self.poll_id, matches_key))
-        if not match_entries:
-            embed.description = "Keine Matches gefunden. Wähle 'Neues Event' um ein Event manuell zu erstellen."
-        else:
-            embed.set_footer(text="Wähle eine Option unten, um die Event-Erstellung zu starten.")
-        await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
+        user_id = interaction.user.id
+        user_opts = get_user_options(self.poll_id, user_id)
+        if not user_opts:
+            await interaction.response.send_message("ℹ️ Du hast noch keine eigenen Ideen in dieser Umfrage.", ephemeral=True)
+            return
+        view = EditOwnIdeasView(self.poll_id, user_id)
+        await interaction.response.send_message("⚙️ Deine eigenen Ideen (nur für dich sichtbar):", view=view, ephemeral=True)
 
+# Event creation UI
 class MatchButton(discord.ui.Button):
     def __init__(self, poll_id: str, matches_key: str, index: int):
         super().__init__(label=f"Wähle {index+1}", style=discord.ButtonStyle.primary)
@@ -567,6 +601,42 @@ class NewEventButton(discord.ui.Button):
             create_event_temp_storage.pop(self.matches_key, None)
         except Exception:
             pass
+
+class CreateEventButton(discord.ui.Button):
+    def __init__(self, poll_id: str):
+        super().__init__(label="📅 Event erstellen", style=discord.ButtonStyle.success, custom_id=f"createevent:{poll_id}")
+        self.poll_id = poll_id
+    async def callback(self, interaction: discord.Interaction):
+        matches = compute_matches_for_poll_from_db(self.poll_id)
+        embed = discord.Embed(title="Matches auswählen — oder Neues Event", color=discord.Color.blue(), timestamp=datetime.now(timezone.utc))
+        match_entries: List[Dict] = []
+        idx = 0
+        for opt_text, infos in matches.items():
+            for info in infos:
+                slot = info.get("slot")
+                users = info.get("users", [])
+                names = [user_display_name(interaction.guild if interaction.guild else None, u) for u in users]
+                names_line = ", ".join(names) if names else "Keine"
+                try:
+                    day, hour_s = slot.split("-")
+                    hour = int(hour_s)
+                    timestr = slot_label_range(day, hour)
+                except Exception:
+                    timestr = slot
+                idx += 1
+                embed.add_field(name=f"{idx}. {opt_text}", value=f"{timestr}\nTeilnehmende: {names_line}", inline=False)
+                match_entries.append({"opt_text": opt_text, "slot": slot, "users": users})
+        matches_key = f"matches:{interaction.user.id}:{self.poll_id}"
+        create_event_temp_storage[matches_key] = {"entries": match_entries}
+        view = discord.ui.View(timeout=180)
+        for i in range(min(len(match_entries), 20)):
+            view.add_item(MatchButton(self.poll_id, matches_key, i))
+        view.add_item(NewEventButton(self.poll_id, matches_key))
+        if not match_entries:
+            embed.description = "Keine Matches gefunden. Wähle 'Neues Event' um ein Event manuell zu erstellen."
+        else:
+            embed.set_footer(text="Wähle eine Option unten, um die Event-Erstellung zu starten.")
+        await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
 
 class CreateEventModal(discord.ui.Modal):
     title_field = discord.ui.TextInput(label="Titel", max_length=100)
@@ -806,7 +876,7 @@ async def build_created_event_embed(event_id: str, guild: Optional[discord.Guild
     return embed
 
 # -------------------------
-# Poll view & button classes (defined after all dependencies above)
+# PollView & PollButton (now defined after all dependencies)
 # -------------------------
 class PollButton(discord.ui.Button):
     def __init__(self, poll_id: str, option_id: int, option_text: str):
@@ -835,41 +905,114 @@ class PollView(discord.ui.View):
         options = get_options(poll_id)
         for opt_id, opt_text, _created, author_id in options:
             self.add_item(PollButton(poll_id, opt_id, opt_text))
-        # Idee hinzufügen (green)
-        self.add_item(AddOptionButton(poll_id))
-        # Verfügbarkeit hinzufügen
-        self.add_item(AddAvailabilityButton(poll_id))
-        # Event erstellen (green calendar)
-        self.add_item(CreateEventButton(poll_id))
-        # Zahnrad
-        self.add_item(OpenEditOwnIdeasButton(poll_id))
+        # Buttons in requested order:
+        self.add_item(AddOptionButton(poll_id))          # green idea button
+        self.add_item(AddAvailabilityButton(poll_id))    # availability (green)
+        self.add_item(CreateEventButton(poll_id))        # event create (green calendar)
+        self.add_item(OpenEditOwnIdeasButton(poll_id))   # gear button
 
 # -------------------------
-# AddAvailabilityButton (must exist before PollView uses it)
+# Reminders & scheduler
 # -------------------------
-class AddAvailabilityButton(discord.ui.Button):
-    def __init__(self, poll_id: str):
-        super().__init__(label="🕓 Verfügbarkeit hinzufügen", style=discord.ButtonStyle.success, custom_id=f"avail:{poll_id}")
-        self.poll_id = poll_id
-    async def callback(self, interaction: discord.Interaction):
-        try:
-            view = AvailabilityDayView(self.poll_id, day_index=0, for_user=interaction.user.id)
-            embed = discord.Embed(
-                title="🕓 Verfügbarkeit auswählen",
-                description="Wähle Stunden für den angezeigten Tag (Mo.–So.). Nach Auswahl: Absenden.",
-                color=discord.Color.green(),
-                timestamp=datetime.now(timezone.utc)
-            )
-            await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
-        except Exception:
-            log.exception("Failed opening AvailabilityDayView")
+scheduler = AsyncIOScheduler(timezone=ZoneInfo(POST_TIMEZONE))
+
+def _remove_created_event_jobs(event_id: str):
+    try:
+        scheduler.remove_job(f"created_event_reminder_24_{event_id}")
+    except Exception:
+        pass
+    try:
+        scheduler.remove_job(f"created_event_reminder_1_{event_id}")
+    except Exception:
+        pass
+
+def schedule_reminders_for_created_event(event_id: str, start_dt: datetime, channel_id: int):
+    _remove_created_event_jobs(event_id)
+    if not start_dt:
+        return
+    if start_dt.tzinfo is None:
+        start_dt = start_dt.replace(tzinfo=ZoneInfo(POST_TIMEZONE))
+    t24 = start_dt - timedelta(hours=24)
+    t1 = start_dt - timedelta(hours=1)
+    now = datetime.now(timezone.utc)
+    if t24 > now:
+        scheduler.add_job(lambda: bot.loop.create_task(_created_event_reminder_coro(event_id, channel_id, 24)),
+                          trigger=DateTrigger(run_date=t24), id=f"created_event_reminder_24_{event_id}", replace_existing=True)
+        log.info("Scheduled created-event 24h reminder for %s at %s", event_id, t24.isoformat())
+    elif t24 <= now < start_dt:
+        bot.loop.create_task(_created_event_reminder_coro(event_id, channel_id, 24))
+    if t1 > now:
+        scheduler.add_job(lambda: bot.loop.create_task(_created_event_reminder_coro(event_id, channel_id, 1)),
+                          trigger=DateTrigger(run_date=t1), id=f"created_event_reminder_1_{event_id}", replace_existing=True)
+        log.info("Scheduled created-event 1h reminder for %s at %s", event_id, t1.isoformat())
+    elif t1 <= now < start_dt:
+        bot.loop.create_task(_created_event_reminder_coro(event_id, channel_id, 1))
+
+async def _created_event_reminder_coro(event_id: str, channel_id: int, hours_before: int):
+    ch = bot.get_channel(channel_id)
+    if not ch:
+        log.info("Reminder: channel %s not found for event %s", channel_id, event_id)
+        return
+    start_iso = None
+    try:
+        rows = db_execute("SELECT posted_channel_id, posted_message_id, start_time FROM created_events WHERE id = ?", (event_id,), fetch=True) or []
+    except Exception:
+        rows = []
+        log.exception("DB error fetching created_events for reminder")
+    if rows:
+        old_ch_id, old_msg_id, start_iso = rows[0]
+        if old_ch_id and old_msg_id:
             try:
-                await interaction.response.send_message("Fehler beim Öffnen der Verfügbarkeits-Auswahl.", ephemeral=True)
+                old_ch = bot.get_channel(old_ch_id)
+                if old_ch:
+                    try:
+                        old_msg = await old_ch.fetch_message(old_msg_id)
+                        try:
+                            await old_msg.delete()
+                        except discord.NotFound:
+                            pass
+                        except Exception:
+                            log.exception("Failed deleting old created event message during reminder")
+                    except discord.NotFound:
+                        try:
+                            db_execute("UPDATE created_events SET posted_channel_id = NULL, posted_message_id = NULL WHERE id = ?", (event_id,))
+                        except Exception:
+                            log.exception("Failed clearing posted refs during reminder")
+                    except Exception:
+                        log.exception("Error fetching old created event message during reminder")
             except Exception:
-                pass
+                log.exception("Failed while handling old created event message during reminder")
+    try:
+        embed = await build_created_event_embed(event_id, None)
+    except Exception:
+        log.exception("Failed building created event embed")
+        embed = discord.Embed(title="📣 Event", description="Details", color=discord.Color.orange())
+    if start_iso:
+        try:
+            sdt = datetime.fromisoformat(start_iso)
+            now_local = datetime.now(sdt.tzinfo or timezone.utc)
+            delta = sdt - now_local
+            hours_left = int(delta.total_seconds() // 3600)
+            new_title = embed.title or "Event"
+            embed.title = f"📣 starts in ~{hours_left}h — {new_title.lstrip('📣 ').strip()}"
+        except Exception:
+            pass
+    view = EventSignupView(event_id)
+    try:
+        bot.add_view(view)
+    except Exception:
+        pass
+    try:
+        sent = await ch.send(embed=embed, view=view)
+        try:
+            db_execute("UPDATE created_events SET posted_channel_id = ?, posted_message_id = ? WHERE id = ?", (ch.id, sent.id, event_id))
+        except Exception:
+            log.exception("Failed to persist created event posted ids during reminder")
+    except Exception:
+        log.exception("Failed to send reminder for created event %s", event_id)
 
 # -------------------------
-# Posting polls & commands
+# Posting polls, commands, scheduler helpers
 # -------------------------
 async def post_poll_to_channel(channel: discord.abc.Messageable):
     poll_id = datetime.now(tz=ZoneInfo(POST_TIMEZONE)).strftime("%Y%m%dT%H%M%S")
@@ -905,9 +1048,7 @@ async def listpolls(ctx, limit: int = 50):
     else:
         await ctx.send(f"Polls:\n{text}")
 
-# -------------------------
 # Daily summary helpers
-# -------------------------
 def get_last_daily_summary(channel_id: int):
     rows = db_execute("SELECT message_id FROM daily_summaries WHERE channel_id = ?", (channel_id,), fetch=True)
     return rows[0][0] if rows and rows[0][0] is not None else None
@@ -1009,7 +1150,7 @@ async def post_daily_summary_to(channel: discord.TextChannel):
         log.exception("Failed saving daily summary id")
 
 # -------------------------
-# Scheduler helpers
+# Scheduler helpers & startup
 # -------------------------
 def job_post_weekly():
     asyncio.create_task(job_post_weekly_coro())
@@ -1050,9 +1191,6 @@ def schedule_daily_summary():
     trigger_evening = CronTrigger(day_of_week="*", hour=18, minute=0, timezone=ZoneInfo(POST_TIMEZONE))
     scheduler.add_job(post_daily_summary, trigger=trigger_evening, id="daily_summary_evening", replace_existing=True)
 
-scheduler = AsyncIOScheduler(timezone=ZoneInfo(POST_TIMEZONE))
-
-# persistent registration
 async def register_persistent_poll_views_async(batch_delay: float = 0.02):
     rows = db_execute("SELECT id FROM polls", fetch=True) or []
     if not rows:
@@ -1066,9 +1204,6 @@ async def register_persistent_poll_views_async(batch_delay: float = 0.02):
             log.exception("Failed to add persistent view for poll %s", poll_id)
         await asyncio.sleep(batch_delay)
 
-# -------------------------
-# Startup hook
-# -------------------------
 @bot.event
 async def on_ready():
     log.info(f"✅ Eingeloggt als {bot.user} (ID: {bot.user.id})")
