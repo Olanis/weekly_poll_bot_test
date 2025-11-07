@@ -324,7 +324,7 @@ def remove_vote(poll_id: str, option_id: int, user_id: int):
                (poll_id, option_id, user_id))
 
 def get_votes_for_poll(poll_id: str):
-    return db_execute("SELECT option_id, user_id FROM votes WHERE poll_id = ?, fetch=True) or []
+    return db_execute("SELECT option_id, user_id FROM votes WHERE poll_id = ?", (poll_id,), fetch=True) or []
 
 def persist_availability(poll_id: str, user_id: int, slots: list):
     db_execute("DELETE FROM availability WHERE poll_id = ? AND user_id = ?", (poll_id, user_id))
