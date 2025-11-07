@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """
 bot.py — Event creation: Single modal with flexible parsing, creates Bot Event only (no Discord Scheduled Event).
-Embed layout adjusted to resemble official Discord Server Event messages.
+Embed layout adjusted to resemble official Discord Server Event messages with customizations.
+Button style changes based on interest status.
 
 Replace your running bot.py with this file and restart the bot.
 """
@@ -272,7 +273,7 @@ def get_votes_for_poll(poll_id: str):
 def persist_availability(poll_id: str, user_id: int, slots: list):
     db_execute("DELETE FROM availability WHERE poll_id = ? AND user_id = ?", (poll_id, user_id))
     if slots:
-        db_execute("INSERT OR IGNORE INTO availability(poll_id, user_id, slot) VALUES (?, ?, ?}",
+        db_execute("INSERT OR IGNORE INTO availability(poll_id, user_id, slot) VALUES (?, ?, ?)",
                    [(poll_id, user_id, s) for s in slots], many=True)
 
 def get_availability_for_poll(poll_id: str):
@@ -696,16 +697,24 @@ class CreateEventModal(discord.ui.Modal, title="Event erstellen"):
             # Create Embed resembling official Discord Server Event
             embed = discord.Embed(
                 title=f"📅 {title}",
-                description=description or "Kein Beschreibung angegeben.",
+                description=description if description else None,  # No description if empty
                 color=discord.Color.blue(),
                 timestamp=datetime.now(timezone.utc)
             )
-            embed.set_thumbnail(url="https://i.imgur.com/XXXXXXX.png")  # Placeholder for event icon; replace with a real URL if needed
+            embed.set_thumbnail(url=interaction.guild.icon.url if interaction.guild and interaction.guild.icon else None)  # Server logo
 
             # Grouped Date/Time
-            start_str = start_dt.strftime("%d.%m.%Y %H:%M")
-            end_str = end_dt.strftime("%d.%m.%Y %H:%M")
-            embed.add_field(name="🕒 Wann", value=f"{start_str} – {end_str}", inline=False)
+            start_str = start_dt.strftime("%d.%m.%y %H:%M")
+            end_str = end_dt.strftime("%d.%m.%y %H:%M")
+            if start_date == end_date:
+                # Same date: "01.01.26 16:00 - 18:00 Uhr"
+                date_part = start_dt.strftime("%d.%m.%y")
+                time_part_start = start_dt.strftime("%H:%M")
+                time_part_end = end_dt.strftime("%H:%M")
+                wann_value = f"{date_part} {time_part_start} – {time_part_end} Uhr"
+            else:
+                wann_value = f"{start_str} – {end_str}"
+            embed.add_field(name="🕒 Wann", value=wann_value, inline=False)
 
             # Location
             embed.add_field(name="📍 Ort", value=location or "Nicht angegeben", inline=False)
@@ -719,9 +728,9 @@ class CreateEventModal(discord.ui.Modal, title="Event erstellen"):
             else:
                 embed.add_field(name="✅ Interessiert", value="Noch niemand", inline=False)
 
-            embed.set_footer(text=f"Event-ID: {event_id} | Erstellt von {user_display_name(interaction.guild, interaction.user.id)}")
+            # No footer
 
-            view = EventSignupView(event_id)
+            view = EventSignupView(event_id, interaction.user.id)
             try:
                 bot.add_view(view)
             except Exception:
@@ -772,25 +781,27 @@ async def build_created_event_embed(event_id: str, guild: Optional[discord.Guild
     title, description, start_iso, end_iso, participants_text, location = rows[0]
     embed = discord.Embed(
         title=f"📅 {title}",
-        description=description or "Kein Beschreibung angegeben.",
+        description=description if description else None,
         color=discord.Color.blue(),
         timestamp=datetime.now(timezone.utc)
     )
-    embed.set_thumbnail(url="https://i.imgur.com/XXXXXXX.png")  # Placeholder
+    embed.set_thumbnail(url=guild.icon.url if guild and guild.icon else None)
     if start_iso:
         try:
-            dt = datetime.fromisoformat(start_iso)
-            start_str = dt.strftime("%d.%m.%Y %H:%M")
-            embed.add_field(name="🕒 Wann", value=start_str, inline=False)
+            start_dt = datetime.fromisoformat(start_iso)
+            end_dt = datetime.fromisoformat(end_iso) if end_iso else None
+            if end_dt and start_dt.date() == end_dt.date():
+                date_part = start_dt.strftime("%d.%m.%y")
+                time_part_start = start_dt.strftime("%H:%M")
+                time_part_end = end_dt.strftime("%H:%M")
+                wann_value = f"{date_part} {time_part_start} – {time_part_end} Uhr"
+            else:
+                start_str = start_dt.strftime("%d.%m.%y %H:%M")
+                end_str = end_dt.strftime("%d.%m.%y %H:%M") if end_dt else ""
+                wann_value = f"{start_str} – {end_str}" if end_str else start_str
+            embed.add_field(name="🕒 Wann", value=wann_value, inline=False)
         except Exception:
             embed.add_field(name="🕒 Wann", value=start_iso, inline=False)
-    if end_iso:
-        try:
-            dt = datetime.fromisoformat(end_iso)
-            end_str = dt.strftime("%d.%m.%Y %H:%M")
-            embed.add_field(name="🕒 Ende", value=end_str, inline=False)  # Adjust if needed
-        except Exception:
-            embed.add_field(name="🕒 Ende", value=end_iso, inline=False)
     if location:
         embed.add_field(name="📍 Ort", value=location, inline=False)
     rows2 = db_execute("SELECT user_id FROM created_event_rsvps WHERE event_id = ?", (event_id,), fetch=True) or []
@@ -800,15 +811,24 @@ async def build_created_event_embed(event_id: str, guild: Optional[discord.Guild
         embed.add_field(name="✅ Interessiert", value=", ".join(names[:20]) + (f", und {len(names)-20} weitere..." if len(names)>20 else ""), inline=False)
     else:
         embed.add_field(name="✅ Interessiert", value="Keine", inline=False)
-    embed.set_footer(text=f"Event-ID: {event_id}")
     return embed
 
 class EventSignupView(discord.ui.View):
-    def __init__(self, event_id: str):
+    def __init__(self, event_id: str, user_id: int = None):
         super().__init__(timeout=None)
         self.event_id = event_id
-    @discord.ui.button(label="Interessiert", style=discord.ButtonStyle.primary, custom_id=None)
-    async def toggle_interested(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self.user_id = user_id
+        # Check if user is interested
+        existing = db_execute("SELECT 1 FROM created_event_rsvps WHERE event_id = ? AND user_id = ?", (event_id, user_id), fetch=True) if user_id else []
+        is_interested = bool(existing)
+        if is_interested:
+            btn = discord.ui.Button(label="✅ Interessiert", style=discord.ButtonStyle.success, emoji="✅", custom_id=f"rsvp:{event_id}")
+        else:
+            btn = discord.ui.Button(label="Interessiert", style=discord.ButtonStyle.secondary, emoji="🔔", custom_id=f"rsvp:{event_id}")
+        btn.callback = self.toggle_interested
+        self.add_item(btn)
+
+    async def toggle_interested(self, interaction: discord.Interaction):
         uid = interaction.user.id
         try:
             existing = db_execute("SELECT 1 FROM created_event_rsvps WHERE event_id = ? AND user_id = ?", (self.event_id, uid), fetch=True)
@@ -830,32 +850,13 @@ class EventSignupView(discord.ui.View):
                 await interaction.response.send_message("Fehler beim Verarbeiten deiner Anmeldung.", ephemeral=True)
             except Exception:
                 pass
-        # best-effort update of posted event message
+        # Update the view and message
         try:
-            rows = db_execute("SELECT posted_channel_id, posted_message_id FROM created_events WHERE id = ?", (self.event_id,), fetch=True) or []
-            if rows:
-                ch_id, msg_id = rows[0]
-                ch = bot.get_channel(ch_id) if ch_id else None
-                if ch and msg_id:
-                    try:
-                        msg = await ch.fetch_message(msg_id)
-                    except discord.NotFound:
-                        db_execute("UPDATE created_events SET posted_channel_id = NULL, posted_message_id = NULL WHERE id = ?", (self.event_id,))
-                        return
-                    except Exception:
-                        log.exception("Failed fetching created event message for update")
-                        return
-                    try:
-                        embed = await build_created_event_embed(self.event_id, ch.guild if hasattr(ch, "guild") else None)
-                        try:
-                            bot.add_view(EventSignupView(self.event_id))
-                        except Exception:
-                            pass
-                        await msg.edit(embed=embed, view=EventSignupView(self.event_id))
-                    except Exception:
-                        log.exception("Failed editing created event message after RSVP")
+            embed = await build_created_event_embed(self.event_id, interaction.guild)
+            new_view = EventSignupView(self.event_id, interaction.user.id)
+            await interaction.message.edit(embed=embed, view=new_view)
         except Exception:
-            log.exception("Failed to update posted message after RSVP toggle")
+            log.exception("Failed to update event message after RSVP")
 
 # Poll button & PollView
 class PollButton(discord.ui.Button):
