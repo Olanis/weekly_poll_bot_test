@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 bot.py — Event creation: Single modal with flexible parsing, creates Bot Event only (no Discord Scheduled Event).
-Embed layout adjusted with user customizations: no confirmation messages, single checkmark on button, larger spacing, icon removed, no footer timestamp.
+Embed layout adjusted with user customizations: no confirmation messages, single checkmark on button, smaller spacing, icon back, no footer.
 
 Replace your running bot.py with this file and restart the bot.
 """
@@ -700,8 +700,7 @@ class CreateEventModal(discord.ui.Modal, title="Event erstellen"):
                 color=discord.Color.blue()
                 # No timestamp
             )
-            # No thumbnail (removed as per request)
-            embed.add_field(name="\u200B", value="\u200B", inline=False)  # Spacer for larger gap
+            embed.set_thumbnail(url=interaction.guild.icon.url if interaction.guild and interaction.guild.icon else None)  # Server logo
 
             # Grouped Date/Time
             start_str = start_dt.strftime("%d.%m.%y %H:%M")
@@ -728,7 +727,7 @@ class CreateEventModal(discord.ui.Modal, title="Event erstellen"):
             else:
                 embed.add_field(name="✅ Interessiert", value="Noch niemand", inline=False)
 
-            embed.set_footer(text=f"Event-ID: {event_id}")
+            # No footer
 
             view = EventSignupView(event_id, interaction.user.id)
             try:
@@ -784,7 +783,7 @@ async def build_created_event_embed(event_id: str, guild: Optional[discord.Guild
         description=description if description else None,
         color=discord.Color.blue()
     )
-    embed.add_field(name="\u200B", value="\u200B", inline=False)  # Spacer
+    embed.set_thumbnail(url=guild.icon.url if guild and guild.icon else None)
     if start_iso:
         try:
             start_dt = datetime.fromisoformat(start_iso)
@@ -810,7 +809,6 @@ async def build_created_event_embed(event_id: str, guild: Optional[discord.Guild
         embed.add_field(name="✅ Interessiert", value=", ".join(names[:20]) + (f", und {len(names)-20} weitere..." if len(names)>20 else ""), inline=False)
     else:
         embed.add_field(name="✅ Interessiert", value="Keine", inline=False)
-    embed.set_footer(text=f"Event-ID: {event_id}")
     return embed
 
 class EventSignupView(discord.ui.View):
@@ -829,6 +827,7 @@ class EventSignupView(discord.ui.View):
         self.add_item(btn)
 
     async def toggle_interested(self, interaction: discord.Interaction):
+        await interaction.response.defer()  # Defer to avoid "interaction failed"
         uid = interaction.user.id
         try:
             existing = db_execute("SELECT 1 FROM created_event_rsvps WHERE event_id = ? AND user_id = ?", (self.event_id, uid), fetch=True)
