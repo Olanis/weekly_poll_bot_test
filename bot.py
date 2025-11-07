@@ -762,9 +762,12 @@ class DayAvailButton(discord.ui.Button):
         uid = interaction.user.id
         _tmp = temp_selections.setdefault(self.poll_id, {})
         user_tmp = _tmp.setdefault(uid, set())
+        # Immer mit aktuellen persisted starten, um Änderungen aufzubauen
         persisted = db_execute("SELECT slot FROM availability WHERE poll_id = ? AND user_id = ?", (self.poll_id, uid), fetch=True)
         persisted_set = set(r[0] for r in persisted) if persisted else set()
-        user_tmp = user_tmp | persisted_set
+        # Setze user_tmp auf persisted, dann modifiziere
+        user_tmp.clear()
+        user_tmp.update(persisted_set)
         if self.day in user_tmp:
             user_tmp.remove(self.day)
         else:
