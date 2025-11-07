@@ -17,6 +17,7 @@ from zoneinfo import ZoneInfo
 from typing import Optional, List, Dict, Set, Tuple
 
 import discord
+print(f"Discord.py Version: {discord.__version__}")
 from discord.ext import commands
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
@@ -1302,3 +1303,4 @@ if __name__ == "__main__":
         raise SystemExit(1)
     init_db()
     bot.run(BOT_TOKEN)
+
