@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-bot.py — Event creation: Single modal with flexible parsing, creates Discord Guild Scheduled Event directly (no version check).
-Falls Scheduled Events nicht verfügbar, schlägt die Erstellung fehl und es wird nur das Bot-Event erstellt.
+bot.py — Event creation: Single modal with flexible parsing, creates Bot Event only (no Discord Scheduled Event).
+Embed layout adjusted to resemble official Discord Server Event messages.
 
 Replace your running bot.py with this file and restart the bot.
 """
@@ -272,7 +272,7 @@ def get_votes_for_poll(poll_id: str):
 def persist_availability(poll_id: str, user_id: int, slots: list):
     db_execute("DELETE FROM availability WHERE poll_id = ? AND user_id = ?", (poll_id, user_id))
     if slots:
-        db_execute("INSERT OR IGNORE INTO availability(poll_id, user_id, slot) VALUES (?, ?, ?)",
+        db_execute("INSERT OR IGNORE INTO availability(poll_id, user_id, slot) VALUES (?, ?, ?}",
                    [(poll_id, user_id, s) for s in slots], many=True)
 
 def get_availability_for_poll(poll_id: str):
@@ -679,15 +679,6 @@ class CreateEventModal(discord.ui.Modal, title="Event erstellen"):
             except Exception:
                 log.exception("Failed adding creator to RSVPs")
 
-            # Create Discord Guild Scheduled Event (direct, no version check)
-            try:
-                scheduled_event = await create_guild_scheduled_event(interaction.guild, title, description, start_dt, end_dt, location)
-                event_link = f"https://discord.com/events/{interaction.guild.id}/{scheduled_event.id}" if scheduled_event else None
-            except Exception:
-                log.exception("Failed to create Guild Scheduled Event")
-                scheduled_event = None
-                event_link = None
-
             target_channel = None
             if CREATED_EVENTS_CHANNEL_ID:
                 target_channel = bot.get_channel(CREATED_EVENTS_CHANNEL_ID)
@@ -702,23 +693,33 @@ class CreateEventModal(discord.ui.Modal, title="Event erstellen"):
                     pass
                 return
 
-            embed = discord.Embed(title=f"📣 {title}", description=description or "", color=discord.Color.orange(), timestamp=datetime.now(timezone.utc))
-            if start_dt:
-                try:
-                    embed.add_field(name="Startdatum", value=start_dt.strftime("%d.%m.%Y"), inline=True)
-                    embed.add_field(name="Beginn", value=start_dt.strftime("%H:%M"), inline=True)
-                except Exception:
-                    embed.add_field(name="Start", value=str(start_dt), inline=False)
-            if end_dt:
-                try:
-                    embed.add_field(name="Enddatum", value=end_dt.strftime("%d.%m.%Y"), inline=True)
-                    embed.add_field(name="Ende", value=end_dt.strftime("%H:%M"), inline=True)
-                except Exception:
-                    embed.add_field(name="Ende", value=str(end_dt), inline=False)
-            if location:
-                embed.add_field(name="Ort", value=location, inline=False)
-            if event_link:
-                embed.add_field(name="Discord Event", value=f"[Zum Event]({event_link})", inline=False)
+            # Create Embed resembling official Discord Server Event
+            embed = discord.Embed(
+                title=f"📅 {title}",
+                description=description or "Kein Beschreibung angegeben.",
+                color=discord.Color.blue(),
+                timestamp=datetime.now(timezone.utc)
+            )
+            embed.set_thumbnail(url="https://i.imgur.com/XXXXXXX.png")  # Placeholder for event icon; replace with a real URL if needed
+
+            # Grouped Date/Time
+            start_str = start_dt.strftime("%d.%m.%Y %H:%M")
+            end_str = end_dt.strftime("%d.%m.%Y %H:%M")
+            embed.add_field(name="🕒 Wann", value=f"{start_str} – {end_str}", inline=False)
+
+            # Location
+            embed.add_field(name="📍 Ort", value=location or "Nicht angegeben", inline=False)
+
+            # RSVP Info
+            rows2 = db_execute("SELECT user_id FROM created_event_rsvps WHERE event_id = ?", (event_id,), fetch=True) or []
+            user_ids = [r[0] for r in rows2]
+            if user_ids:
+                names = [user_display_name(interaction.guild, uid) for uid in user_ids]
+                embed.add_field(name="✅ Interessiert", value=", ".join(names[:10]) + (f" und {len(names)-10} weitere..." if len(names)>10 else ""), inline=False)
+            else:
+                embed.add_field(name="✅ Interessiert", value="Noch niemand", inline=False)
+
+            embed.set_footer(text=f"Event-ID: {event_id} | Erstellt von {user_display_name(interaction.guild, interaction.user.id)}")
 
             view = EventSignupView(event_id)
             try:
@@ -738,7 +739,7 @@ class CreateEventModal(discord.ui.Modal, title="Event erstellen"):
             if start_dt:
                 schedule_reminders_for_created_event(event_id, start_dt, target_channel.id)
             try:
-                await interaction.response.send_message("✅ Event erstellt und gepostet." + (f" [Discord Event Link]({event_link})" if event_link else ""), ephemeral=True)
+                await interaction.response.send_message("✅ Event erstellt und gepostet.", ephemeral=True)
             except Exception:
                 pass
         except Exception:
@@ -747,57 +748,6 @@ class CreateEventModal(discord.ui.Modal, title="Event erstellen"):
                 await interaction.response.send_message("Interner Fehler beim Verarbeiten des Formulars.", ephemeral=True)
             except Exception:
                 pass
-
-# Helper function to create Guild Scheduled Event (direct)
-async def create_guild_scheduled_event(guild: discord.Guild, name: str, description: str, start_dt: datetime, end_dt: datetime, location: str) -> Optional[discord.ScheduledEvent]:
-    """
-    Creates a Guild Scheduled Event. Requires Manage Events permission.
-    If location starts with '#', tries to bind to voice channel; else external.
-    """
-    if not guild.me.guild_permissions.manage_events:
-        raise PermissionError("Bot benötigt Manage Events Berechtigung.")
-
-    if location.startswith("#"):
-        # Try to find voice/stage channel
-        channel_name = location[1:].strip()  # remove #
-        channel = None
-        for ch in guild.channels:
-            if ch.name.lower() == channel_name.lower() and isinstance(ch, (discord.VoiceChannel, discord.StageChannel)):
-                channel = ch
-                break
-        if channel:
-            event = await guild.create_scheduled_event(
-                name=name,
-                start_time=start_dt,
-                end_time=end_dt,
-                description=description or None,
-                channel=channel,
-                privacy_level=discord.PrivacyLevel.guild_only,
-                entity_type=discord.ScheduledEventEntityType.stage_instance if isinstance(channel, discord.StageChannel) else discord.ScheduledEventEntityType.voice
-            )
-        else:
-            # Fallback to external
-            event = await guild.create_scheduled_event(
-                name=name,
-                start_time=start_dt,
-                end_time=end_dt,
-                description=description or None,
-                privacy_level=discord.PrivacyLevel.guild_only,
-                entity_type=discord.ScheduledEventEntityType.external,
-                location=location
-            )
-    else:
-        # External event
-        event = await guild.create_scheduled_event(
-            name=name,
-            start_time=start_dt,
-            end_time=end_dt,
-            description=description or None,
-            privacy_level=discord.PrivacyLevel.guild_only,
-            entity_type=discord.ScheduledEventEntityType.external,
-            location=location
-        )
-    return event
 
 # Simplified event creation buttons
 class CreateEventButton(discord.ui.Button):
@@ -820,32 +770,37 @@ async def build_created_event_embed(event_id: str, guild: Optional[discord.Guild
     if not rows:
         return discord.Embed(title="Event", description="(Details fehlen)", color=discord.Color.dark_grey())
     title, description, start_iso, end_iso, participants_text, location = rows[0]
-    embed = discord.Embed(title=f"📣 {title}", description=description or "", color=discord.Color.orange(), timestamp=datetime.now(timezone.utc))
+    embed = discord.Embed(
+        title=f"📅 {title}",
+        description=description or "Kein Beschreibung angegeben.",
+        color=discord.Color.blue(),
+        timestamp=datetime.now(timezone.utc)
+    )
+    embed.set_thumbnail(url="https://i.imgur.com/XXXXXXX.png")  # Placeholder
     if start_iso:
         try:
             dt = datetime.fromisoformat(start_iso)
-            embed.add_field(name="Startdatum", value=dt.strftime("%d.%m.%Y"), inline=True)
-            embed.add_field(name="Beginn", value=dt.strftime("%H:%M"), inline=True)
+            start_str = dt.strftime("%d.%m.%Y %H:%M")
+            embed.add_field(name="🕒 Wann", value=start_str, inline=False)
         except Exception:
-            embed.add_field(name="Start", value=start_iso, inline=False)
+            embed.add_field(name="🕒 Wann", value=start_iso, inline=False)
     if end_iso:
         try:
             dt = datetime.fromisoformat(end_iso)
-            embed.add_field(name="Enddatum", value=dt.strftime("%d.%m.%Y"), inline=True)
-            embed.add_field(name="Ende", value=dt.strftime("%H:%M"), inline=True)
+            end_str = dt.strftime("%d.%m.%Y %H:%M")
+            embed.add_field(name="🕒 Ende", value=end_str, inline=False)  # Adjust if needed
         except Exception:
-            embed.add_field(name="Ende", value=end_iso, inline=False)
-    if participants_text:
-        embed.add_field(name="Teilnehmende", value=participants_text, inline=False)
+            embed.add_field(name="🕒 Ende", value=end_iso, inline=False)
+    if location:
+        embed.add_field(name="📍 Ort", value=location, inline=False)
     rows2 = db_execute("SELECT user_id FROM created_event_rsvps WHERE event_id = ?", (event_id,), fetch=True) or []
     user_ids = [r[0] for r in rows2]
     if user_ids:
         names = [user_display_name(guild, uid) for uid in user_ids]
-        embed.add_field(name="Interessiert", value=", ".join(names[:20]) + (f", und {len(names)-20} weitere..." if len(names)>20 else ""), inline=False)
+        embed.add_field(name="✅ Interessiert", value=", ".join(names[:20]) + (f", und {len(names)-20} weitere..." if len(names)>20 else ""), inline=False)
     else:
-        embed.add_field(name="Interessiert", value="Keine", inline=False)
-    if location:
-        embed.add_field(name="Ort", value=location, inline=False)
+        embed.add_field(name="✅ Interessiert", value="Keine", inline=False)
+    embed.set_footer(text=f"Event-ID: {event_id}")
     return embed
 
 class EventSignupView(discord.ui.View):
@@ -1058,7 +1013,7 @@ async def _created_event_reminder_coro(event_id: str, channel_id: int, hours_bef
             delta = sdt - now_local
             hours_left = int(delta.total_seconds() // 3600)
             new_title = embed.title or "Event"
-            embed.title = f"📣 starts in ~{hours_left}h — {new_title.lstrip('📣 ').strip()}"
+            embed.title = f"📣 starts in ~{hours_left}h — {new_title.lstrip('📅 ').strip()}"
         except Exception:
             pass
     view = EventSignupView(event_id)
