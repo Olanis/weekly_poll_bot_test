@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 bot.py — Event creation: Step1 -> directly opens Step2 modal (no extra click).
-Tries to use native Date/Time pickers if available at runtime; falls nicht, TextInput fallback (DD.MM.YYYY, HH:MM).
+Fixed: create_step2_modal_instance now always returns TextInput-based modal to avoid Invalid Form Body errors.
 Keeps previous behaviors: silent availability save, Startdatum/Enddatum fields etc.
 
 Replace your running bot.py with this file and restart the bot.
@@ -800,136 +800,8 @@ class CreateEventStep2Modal_TextInput(discord.ui.Modal, title="Event: Datum, Zei
             except Exception:
                 pass
 
-# Factory that attempts to build a native Date/Time modal if supported; otherwise returns TextInput modal instance.
+# Factory: always return TextInput modal to avoid Invalid Form Body errors
 def create_step2_modal_instance(tmp_key: str) -> discord.ui.Modal:
-    """
-    Tries to construct a modal using native Date/Time pickers if available in the runtime discord.ui.
-    Falls back to CreateEventStep2Modal_TextInput.
-    """
-    DatePicker = getattr(discord.ui, "DatePicker", None) or getattr(discord.ui, "DateSelect", None)
-    TimePicker = getattr(discord.ui, "TimePicker", None) or getattr(discord.ui, "TimeSelect", None)
-    if DatePicker is not None:
-        try:
-            # Attempt to dynamically construct a Modal with native pickers.
-            # The exact constructor signature for native pickers may vary across libraries;
-            # we wrap in try/except and fall back on failure.
-            class CreateEventStep2Modal_Native(discord.ui.Modal, title="Event: Datum, Zeit & Ort"):
-                # try to instantiate native picker components; if signature differs, this will raise and be caught.
-                start_date = DatePicker(label="Startdatum")
-                end_date = DatePicker(label="Enddatum")
-                # For time, if there's a TimePicker/TimeSelect, use it; otherwise omit and rely on text fallback below.
-                if TimePicker is not None:
-                    start_time = TimePicker(label="Beginn")
-                    end_time = TimePicker(label="Ende")
-                else:
-                    # fallback single-line text fields for times
-                    start_time = discord.ui.TextInput(label="Beginn", style=discord.TextStyle.short, placeholder="18:00", max_length=8)
-                    end_time = discord.ui.TextInput(label="Ende", style=discord.TextStyle.short, placeholder="20:00", max_length=8)
-                location_field = discord.ui.TextInput(label="Ort", style=discord.TextStyle.short, required=False, max_length=200)
-                def __init__(self, tmp_key_inner: str):
-                    super().__init__(title="Event: Datum, Zeit & Ort")
-                    self.tmp_key = tmp_key_inner
-                    data = create_event_temp_storage.get(tmp_key_inner, {})
-                    # If pickers provide a default-setting API, we'd set defaults here — unknown across libs, so skip.
-                async def on_submit(self, interaction: discord.Interaction):
-                    try:
-                        tmp = create_event_temp_storage.setdefault(self.tmp_key, {})
-                        # read values from pickers/text inputs; names depend on picker classes
-                        # Use safe getattr and parsing fallback.
-                        # start_date_val = getattr(self, 'start_date').value or None
-                        try:
-                            sd_comp = getattr(self, 'start_date', None)
-                            if sd_comp is not None:
-                                # many picker components expose .value as datetime.date
-                                sd_val = getattr(sd_comp, "value", None)
-                                if isinstance(sd_val, date):
-                                    start_date = sd_val
-                                else:
-                                    start_date = None
-                            else:
-                                start_date = None
-                        except Exception:
-                            start_date = None
-                        try:
-                            ed_comp = getattr(self, 'end_date', None)
-                            if ed_comp is not None:
-                                ed_val = getattr(ed_comp, "value", None)
-                                if isinstance(ed_val, date):
-                                    end_date = ed_val
-                                else:
-                                    end_date = None
-                            else:
-                                end_date = None
-                        except Exception:
-                            end_date = None
-                        # times: if native time pickers exist, attempt to read; otherwise read text fields
-                        start_time = None
-                        end_time = None
-                        try:
-                            st_comp = getattr(self, 'start_time', None)
-                            if st_comp is not None:
-                                st_val = getattr(st_comp, "value", None)
-                                if isinstance(st_val, _time):
-                                    start_time = st_val
-                                elif isinstance(st_val, str):
-                                    start_time = parse_time_hhmm(st_val)
-                                else:
-                                    start_time = None
-                        except Exception:
-                            start_time = None
-                        try:
-                            et_comp = getattr(self, 'end_time', None)
-                            if et_comp is not None:
-                                et_val = getattr(et_comp, "value", None)
-                                if isinstance(et_val, _time):
-                                    end_time = et_val
-                                elif isinstance(et_val, str):
-                                    end_time = parse_time_hhmm(et_val)
-                                else:
-                                    end_time = None
-                        except Exception:
-                            end_time = None
-                        # If any of these are None, fall back to ephemeral error
-                        if not start_date or not end_date or not start_time or not end_time:
-                            try:
-                                await interaction.response.send_message("Datum/Uhrzeit konnte nicht geparst (native picker). Bitte benutze das erwartete Format.", ephemeral=True)
-                            except Exception:
-                                log.exception("Failed to send invalid-date message for native modal")
-                            return
-                        tz = ZoneInfo(POST_TIMEZONE)
-                        start_dt = datetime(start_date.year, start_date.month, start_date.day, start_time.hour, start_time.minute, tzinfo=tz)
-                        end_dt = datetime(end_date.year, end_date.month, end_date.day, end_time.hour, end_time.minute, tzinfo=tz)
-                        tmp.update({
-                            "start_dt": start_dt.isoformat(),
-                            "end_dt": end_dt.isoformat(),
-                            "location": getattr(self, 'location_field').value.strip() if getattr(self, 'location_field', None) else tmp.get("default_location", ""),
-                            "participants_text": tmp.get("participants_text", tmp.get("mentions", "")),
-                        })
-                        view = FinalizeEventView(self.tmp_key, interaction.user.id)
-                        summary_lines = [
-                            f"**Titel:** {tmp.get('title')}",
-                            f"**Startdatum:** {start_dt.strftime('%d.%m.%Y')}",
-                            f"**Beginn:** {start_dt.strftime('%H:%M')}",
-                            f"**Enddatum:** {end_dt.strftime('%d.%m.%Y')}",
-                            f"**Ende:** {end_dt.strftime('%H:%M')}",
-                            f"**Ort:** {tmp.get('location') or '—'}",
-                            f"**Teilnehmende:** {tmp.get('participants_text') or '—'}",
-                        ]
-                        try:
-                            await interaction.response.send_message("Event-Entwurf:\n" + "\n".join(summary_lines), view=view, ephemeral=True)
-                        except Exception:
-                            log.exception("Failed to send event draft after native Step2 submit")
-                    except Exception:
-                        log.exception("Unhandled error in CreateEventStep2Modal_Native.on_submit")
-                        try:
-                            await interaction.response.send_message("Interner Fehler beim Verarbeiten des Formulars.", ephemeral=True)
-                        except Exception:
-                            pass
-            # If constructing dynamic class succeeded, return an instance
-            return CreateEventStep2Modal_Native(tmp_key)
-        except Exception:
-            log.exception("Failed building native Step2 modal; falling back to TextInput modal")
-    # fallback
     return CreateEventStep2Modal_TextInput(tmp_key)
 
 # EditParticipantsModal, EditDescriptionLocationModal, FinalizeEventView, EventSignupView, build_created_event_embed etc.
