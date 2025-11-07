@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 bot.py — Event creation: Single modal with flexible parsing, creates Bot Event only (no Discord Scheduled Event).
-Embed layout adjusted with user customizations: no confirmation messages, single checkmark on button, smaller spacing, icon back, no footer.
+Embed layout adjusted with minimal spacing, no confirmation message, fixed HourButton callback.
 
 Replace your running bot.py with this file and restart the bot.
 """
@@ -447,7 +447,7 @@ class HourButton(discord.ui.Button):
         self.day = day
         self.hour = hour
         self.slot = f"{day}-{hour}"
-    async def callback(self, interaction: discord.Interaction, button: discord.ui.Button):
+    async def callback(self, interaction: discord.Interaction):  # Fixed: removed 'button' parameter
         uid = interaction.user.id
         _tmp = temp_selections.setdefault(self.poll_id, {})
         user_tmp = _tmp.setdefault(uid, set())
@@ -702,6 +702,9 @@ class CreateEventModal(discord.ui.Modal, title="Event erstellen"):
             )
             embed.set_thumbnail(url=interaction.guild.icon.url if interaction.guild and interaction.guild.icon else None)  # Server logo
 
+            # Minimal larger spacing: use a small text spacer
+            embed.add_field(name=" ", value=" ", inline=False)
+
             # Grouped Date/Time
             start_str = start_dt.strftime("%d.%m.%y %H:%M")
             end_str = end_dt.strftime("%d.%m.%y %H:%M")
@@ -746,10 +749,7 @@ class CreateEventModal(discord.ui.Modal, title="Event erstellen"):
                 return
             if start_dt:
                 schedule_reminders_for_created_event(event_id, start_dt, target_channel.id)
-            try:
-                await interaction.response.send_message("✅ Event erstellt und gepostet.", ephemeral=True)
-            except Exception:
-                pass
+            # Removed confirmation message
         except Exception:
             log.exception("Unhandled error in CreateEventModal.on_submit")
             try:
@@ -784,6 +784,7 @@ async def build_created_event_embed(event_id: str, guild: Optional[discord.Guild
         color=discord.Color.blue()
     )
     embed.set_thumbnail(url=guild.icon.url if guild and guild.icon else None)
+    embed.add_field(name=" ", value=" ", inline=False)  # Minimal larger spacing
     if start_iso:
         try:
             start_dt = datetime.fromisoformat(start_iso)
