@@ -3,7 +3,7 @@
 bot.py — Event creation: Single modal with flexible parsing, creates Bot Event only (no Discord Scheduled Event).
 Embed layout adjusted: no confirmation on idea delete, no icons in event embed, matches back in poll embed.
 Daily summary now shows only new matches since last post.
-Added quarterly poll with day-based availability, improved navigation within one message, fixed view attribute access, added labels for sections, fixed PollView definition, fixed day selection persistence, updated week calculation to Monday-Sunday, removed checkmarks from weekly poll.
+Added quarterly poll with day-based availability, improved navigation within one message, fixed view attribute access, added labels for sections, fixed PollView definition, fixed day selection persistence, updated week calculation to Monday-Sunday, removed checkmarks from weekly poll, added weekly summary for quarterly poll.
 
 Replace your running bot.py with this file and restart the bot.
 """
@@ -734,6 +734,9 @@ class WeekSelectButton(discord.ui.Button):
         # Set styles for day buttons based on user selections
         uid = interaction.user.id
         user_tmp = temp_selections.get(self.poll_id, {}).get(uid, set())
+        if not user_tmp:
+            persisted = db_execute("SELECT slot FROM availability WHERE poll_id = ? AND user_id = ?", (self.poll_id, uid), fetch=True)
+            user_tmp = set(r[0] for r in persisted) if persisted else set()
         for item in new_view.children:
             if isinstance(item, DayAvailButton):
                 if item.day in user_tmp:
@@ -1189,7 +1192,7 @@ class CreateEventButton(discord.ui.Button):
             view = SelectMatchView(self.poll_id, matches)
             embed = discord.Embed(
                 title="🎯 Event aus Match erstellen",
-                description="Wähle ein bestehendes Match aus, um ein Event vorzubefüllen, oder erstelle ein neues.",
+                description="Wähle ein bestehendes Match aus, um ein Event vorzubefüllt zu erhalten, oder erstelle ein neues.",
                 color=discord.Color.blue()
             )
             try:
