@@ -3,7 +3,7 @@
 bot.py — Event creation: Single modal with flexible parsing, creates Bot Event only (no Discord Scheduled Event).
 Embed layout adjusted: no confirmation on idea delete, no icons in event embed, matches back in poll embed.
 Daily summary now shows only new matches since last post.
-Added quarterly poll with day-based availability, improved navigation within one message, fixed view attribute access, added labels for sections, fixed PollView definition, fixed day selection persistence, updated week calculation to Monday-Sunday.
+Added quarterly poll with day-based availability, improved navigation within one message, fixed view attribute access, added labels for sections, fixed PollView definition, fixed day selection persistence, updated week calculation to Monday-Sunday, removed checkmarks from weekly poll.
 
 Replace your running bot.py with this file and restart the bot.
 """
@@ -87,6 +87,13 @@ def init_db():
         )
     """)
     cur.execute("""
+        CREATE TABLE IF NOT EXISTS weekly_summaries (
+            channel_id INTEGER PRIMARY KEY,
+            message_id INTEGER,
+            created_at TEXT NOT NULL
+        )
+    """)
+    cur.execute("""
         CREATE TABLE IF NOT EXISTS created_events (
             id TEXT PRIMARY KEY,
             poll_id TEXT,
@@ -110,6 +117,13 @@ def init_db():
     """)
     cur.execute("""
         CREATE TABLE IF NOT EXISTS last_posted_matches (
+            poll_id TEXT PRIMARY KEY,
+            matches TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        )
+    """)
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS last_posted_weekly_matches (
             poll_id TEXT PRIMARY KEY,
             matches TEXT NOT NULL,
             updated_at TEXT NOT NULL
@@ -393,6 +407,20 @@ def set_last_posted_matches(poll_id: str, matches: dict):
     db_execute("INSERT OR REPLACE INTO last_posted_matches(poll_id, matches, updated_at) VALUES (?, ?, ?)",
                (poll_id, matches_str, now))
 
+def get_last_posted_weekly_matches(poll_id: str):
+    rows = db_execute("SELECT matches FROM last_posted_weekly_matches WHERE poll_id = ?", (poll_id,), fetch=True)
+    if rows:
+        import json
+        return json.loads(rows[0][0])
+    return {}
+
+def set_last_posted_weekly_matches(poll_id: str, matches: dict):
+    import json
+    matches_str = json.dumps(matches)
+    now = datetime.now(timezone.utc).isoformat()
+    db_execute("INSERT OR REPLACE INTO last_posted_weekly_matches(poll_id, matches, updated_at) VALUES (?, ?, ?)",
+               (poll_id, matches_str, now))
+
 def generate_poll_embed_from_db(poll_id: str, guild: Optional[discord.Guild] = None):
     options = get_options(poll_id)
     votes = get_votes_for_poll(poll_id)
@@ -651,10 +679,8 @@ class AvailabilityDayView(discord.ui.View):
             selected = (slot in user_temp)
             if selected:
                 btn.style = discord.ButtonStyle.success
-                btn.label = f"✅ {slot_label_range(day, hour)}"
             else:
                 btn.style = discord.ButtonStyle.secondary
-                btn.label = slot_label_range(day, hour)
             self.add_item(btn)
         last_hour_row = day_rows + ((len(HOURS) - 1) // 5)
         controls_row = min(4, last_hour_row + 1)
@@ -1466,6 +1492,14 @@ async def startquarterlypoll(ctx):
         await ctx.send(f"Fehler beim Erstellen der Quartalsumfrage: {e}")
 
 @bot.command()
+async def weeklysummary(ctx):
+    try:
+        await post_weekly_summary_to(ctx.channel)
+    except Exception as e:
+        log.exception("weeklysummary failed")
+        await ctx.send(f"Fehler beim Erstellen der wöchentlichen Zusammenfassung: {e}")
+
+@bot.command()
 async def listpolls(ctx, limit: int = 50):
     rows = db_execute("SELECT id, created_at FROM polls ORDER BY created_at DESC LIMIT ?", (limit,), fetch=True)
     if not rows:
@@ -1486,6 +1520,15 @@ def get_last_daily_summary(channel_id: int):
 def set_last_daily_summary(channel_id: int, message_id: int):
     now = datetime.now(timezone.utc).isoformat()
     db_execute("INSERT OR REPLACE INTO daily_summaries(channel_id, message_id, created_at) VALUES (?, ?, ?)",
+               (channel_id, message_id, now))
+
+def get_last_weekly_summary(channel_id: int):
+    rows = db_execute("SELECT message_id FROM weekly_summaries WHERE channel_id = ?", (channel_id,), fetch=True)
+    return rows[0][0] if rows and rows[0][0] is not None else None
+
+def set_last_weekly_summary(channel_id: int, message_id: int):
+    now = datetime.now(timezone.utc).isoformat()
+    db_execute("INSERT OR REPLACE INTO weekly_summaries(channel_id, message_id, created_at) VALUES (?, ?, ?)",
                (channel_id, message_id, now))
 
 async def post_daily_summary():
@@ -1593,6 +1636,96 @@ async def post_daily_summary_to(channel: discord.TextChannel):
     except Exception:
         log.exception("Failed saving daily summary id or last matches")
 
+async def post_weekly_summary():
+    await bot.wait_until_ready()
+    channel = None
+    if QUARTERLY_CHANNEL_ID:
+        channel = bot.get_channel(QUARTERLY_CHANNEL_ID)
+    if not channel:
+        log.info("Kein Quartals-Kanal gefunden für Weekly Summary.")
+        return
+    await post_weekly_summary_to(channel)
+
+async def post_weekly_summary_to(channel: discord.TextChannel):
+    rows = db_execute("SELECT id, created_at FROM polls WHERE id LIKE '%_quarterly' ORDER BY created_at DESC LIMIT 1", fetch=True)
+    if not rows:
+        return
+    poll_id, poll_created = rows[0]
+    tz = ZoneInfo(POST_TIMEZONE)
+    since = datetime.now(tz=tz) - timedelta(weeks=1)
+    new_options = get_options_since(poll_id, since)
+    current_matches = compute_matches_for_poll_from_db(poll_id)
+    last_matches = get_last_posted_weekly_matches(poll_id)
+    new_matches = {}
+    for key, infos in current_matches.items():
+        if key not in last_matches:
+            new_matches[key] = infos
+        else:
+            # Check if new infos
+            last_infos = last_matches[key]
+            for info in infos:
+                if info not in last_infos:
+                    if key not in new_matches:
+                        new_matches[key] = []
+                    new_matches[key].append(info)
+    if (not new_options) and (not new_matches):
+        return
+    embed = discord.Embed(title="🗓️ Wöchentliches Update: Matches & neue Ideen", color=discord.Color.blue(), timestamp=datetime.now(tz=tz))
+    if new_options:
+        lines = []
+        for opt_text, created_at in new_options:
+            try:
+                t = datetime.fromisoformat(created_at).astimezone(tz)
+                tstr = t.strftime("%d.%m. %H:%M")
+            except Exception:
+                tstr = created_at
+            lines.append(f"- {opt_text} (hinzugefügt {tstr})")
+        embed.add_field(name="🆕 Neue Ideen", value="\n".join(lines), inline=False)
+    else:
+        embed.add_field(name="🆕 Neue Ideen", value="Keine", inline=False)
+    if new_matches:
+        for opt_text, infos in new_matches.items():
+            lines = []
+            for info in infos:
+                slot = info["slot"]
+                names = [user_display_name(channel.guild if isinstance(channel, discord.TextChannel) else None, u) for u in info["users"]]
+                lines.append(f"{slot}: {', '.join(names)}")
+            embed.add_field(name=f"🤝 Neue Matches — {opt_text}", value="\n".join(lines), inline=False)
+    else:
+        embed.add_field(name="🤝 Neue Matches", value="Keine neuen gemeinsamen Tage seit dem letzten Update.", inline=False)
+    voter_rows = db_execute("SELECT DISTINCT user_id FROM votes WHERE poll_id = ?", (poll_id,), fetch=True)
+    voters = [r[0] for r in voter_rows] if voter_rows else []
+    avail_rows = db_execute("SELECT DISTINCT user_id FROM availability WHERE poll_id = ?", (poll_id,), fetch=True)
+    has_avail = {r[0] for r in avail_rows} if avail_rows else set()
+    voters_no_avail = [uid for uid in voters if uid not in has_avail]
+    if voters_no_avail:
+        names = [user_display_name(channel.guild if isinstance(channel, discord.TextChannel) else None, uid) for uid in voters_no_avail]
+        if len(names) > 30:
+            shown = names[:30]
+            remaining = len(names) - 30
+            names_line = ", ".join(shown) + f", und {remaining} weitere..."
+        else:
+            names_line = ", ".join(names)
+        embed.add_field(name="ℹ️ Abstimmende ohne eingetragene Tage", value=names_line, inline=False)
+    else:
+        embed.add_field(name="ℹ️ Abstimmende ohne eingetragene Tage", value="Alle Abstimmenden haben Tage eingetragen.", inline=False)
+    last_msg_id = get_last_weekly_summary(channel.id)
+    if last_msg_id:
+        try:
+            prev = await channel.fetch_message(last_msg_id)
+            if prev:
+                await prev.delete()
+        except discord.NotFound:
+            pass
+        except Exception:
+            log.exception("Failed deleting previous weekly summary")
+    sent = await channel.send(embed=embed)
+    try:
+        set_last_weekly_summary(channel.id, sent.id)
+        set_last_posted_weekly_matches(poll_id, current_matches)
+    except Exception:
+        log.exception("Failed saving weekly summary id or last matches")
+
 # Scheduler helpers & startup
 def job_post_weekly():
     asyncio.create_task(job_post_weekly_coro())
@@ -1652,6 +1785,10 @@ def schedule_quarterly_post():
     trigger = CronTrigger(day=1, month=prev_month, year=year, hour=12, minute=0, timezone=ZoneInfo(POST_TIMEZONE))
     scheduler.add_job(job_post_quarterly, trigger=trigger, id="quarterly_poll", replace_existing=True)
 
+def schedule_weekly_summary():
+    trigger = CronTrigger(day_of_week="mon", hour=9, minute=0, timezone=ZoneInfo(POST_TIMEZONE))
+    scheduler.add_job(post_weekly_summary, trigger=trigger, id="weekly_summary", replace_existing=True)
+
 def schedule_daily_summary():
     trigger_morning = CronTrigger(day_of_week="*", hour=9, minute=0, timezone=ZoneInfo(POST_TIMEZONE))
     scheduler.add_job(post_daily_summary, trigger=trigger_morning, id="daily_summary_morning", replace_existing=True)
@@ -1682,6 +1819,7 @@ async def on_ready():
         scheduler.start()
     schedule_weekly_post()
     schedule_quarterly_post()
+    schedule_weekly_summary()
     schedule_daily_summary()
     try:
         bot.loop.create_task(register_persistent_poll_views_async(batch_delay=0.02))
