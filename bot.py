@@ -1192,7 +1192,7 @@ class CreateEventButton(discord.ui.Button):
             view = SelectMatchView(self.poll_id, matches)
             embed = discord.Embed(
                 title="🎯 Event aus Match erstellen",
-                description="Wähle ein bestehendes Match aus, um ein Event vorzubefüllt zu erhalten, oder erstelle ein neues.",
+                description="Wähle ein bestehendes Match aus, um ein Event vorzubefüllen, oder erstelle ein neues.",
                 color=discord.Color.blue()
             )
             try:
@@ -1263,6 +1263,11 @@ class QuarterlyAddAvailabilityButton(discord.ui.Button):
         super().__init__(label="🗓️ Verfügbarkeit hinzufügen", style=discord.ButtonStyle.success, custom_id=f"qavail:{poll_id}")
         self.poll_id = poll_id
     async def callback(self, interaction: discord.Interaction):
+        uid = interaction.user.id
+        pst = temp_selections.setdefault(self.poll_id, {})
+        if uid not in pst:
+            persisted = db_execute("SELECT slot FROM availability WHERE poll_id = ? AND user_id = ?", (self.poll_id, uid), fetch=True)
+            pst[uid] = set(r[0] for r in persisted) if persisted else set()
         try:
             view = QuarterlyAvailabilityView(self.poll_id)
             embed = discord.Embed(
