@@ -3,7 +3,7 @@
 bot.py — Event creation: Single modal with flexible parsing, creates Bot Event only (no Discord Scheduled Event).
 Embed layout adjusted: no confirmation on idea delete, no icons in event embed, matches back in poll embed.
 Daily summary now shows only new matches since last post.
-Added quarterly poll with day-based availability, improved navigation within one message, fixed view attribute access, added labels for sections.
+Added quarterly poll with day-based availability, improved navigation within one message, fixed view attribute access, added labels for sections, fixed PollView definition.
 
 Replace your running bot.py with this file and restart the bot.
 """
@@ -286,7 +286,7 @@ def get_week_days(week_start: date, week_end: date) -> List[str]:
     days = []
     current = week_start
     while current <= week_end:
-        days.append(f"{DAYS[current.weekday()]} {current.strftime('%d.%m.')}")
+        days.append(f"{DAYS[current.weekday()]}. {current.strftime('%d.%m.')}")
         current += timedelta(days=1)
     return days
 
@@ -771,7 +771,7 @@ class QuarterlyAvailabilityView(discord.ui.View):
         self.days = days or []
         # Add month label and buttons
         if self.months:
-            self.add_item(discord.ui.Button(label="Monate:", style=discord.ButtonStyle.secondary, disabled=True))
+            self.add_item(discord.ui.Button(label="Monate", style=discord.ButtonStyle.secondary, disabled=True))
             for i in range(3):
                 btn = MonthSelectButton(poll_id, i, self.months)
                 if selected_month is not None and i == selected_month:
@@ -779,7 +779,7 @@ class QuarterlyAvailabilityView(discord.ui.View):
                 self.add_item(btn)
         # Add week label and buttons if month selected
         if weeks:
-            self.add_item(discord.ui.Button(label="Wochen:", style=discord.ButtonStyle.secondary, disabled=True))
+            self.add_item(discord.ui.Button(label="Wochen", style=discord.ButtonStyle.secondary, disabled=True))
             for i, (label, _, _) in enumerate(weeks):
                 btn = WeekSelectButton(poll_id, i, weeks)
                 if selected_week is not None and i == selected_week:
@@ -787,7 +787,7 @@ class QuarterlyAvailabilityView(discord.ui.View):
                 self.add_item(btn)
         # Add day label and buttons if week selected
         if days:
-            self.add_item(discord.ui.Button(label="Tage:", style=discord.ButtonStyle.secondary, disabled=True))
+            self.add_item(discord.ui.Button(label="Tage", style=discord.ButtonStyle.secondary, disabled=True))
             for day in days:
                 btn = DayAvailButton(poll_id, day)
                 uid = None  # Can't get uid here, handle in callback
@@ -795,6 +795,72 @@ class QuarterlyAvailabilityView(discord.ui.View):
         # Add submit button
         submit = QuarterlySubmitButton(poll_id)
         self.add_item(submit)
+
+class PollView(discord.ui.View):
+    def __init__(self, poll_id: str):
+        super().__init__(timeout=None)
+        self.poll_id = poll_id
+        options = get_options(poll_id)
+        for opt_id, opt_text, _created, author_id in options:
+            try:
+                self.add_item(PollButton(poll_id, opt_id, opt_text))
+            except Exception:
+                pass
+        try:
+            self.add_item(AddOptionButton(poll_id))
+        except Exception:
+            pass
+        try:
+            self.add_item(AddAvailabilityButton(poll_id))
+        except Exception:
+            pass
+        try:
+            self.add_item(CreateEventButton(poll_id))
+        except Exception:
+            pass
+        try:
+            self.add_item(OpenEditOwnIdeasButton(poll_id))
+        except Exception:
+            pass
+
+class PollButton(discord.ui.Button):
+    def __init__(self, poll_id: str, option_id: int, option_text: str):
+        super().__init__(label=option_text, style=discord.ButtonStyle.primary, custom_id=f"poll:{poll_id}:{option_id}")
+        self.poll_id = poll_id
+        self.option_id = option_id
+    async def callback(self, interaction: discord.Interaction):
+        uid = interaction.user.id
+        rows = db_execute("SELECT 1 FROM votes WHERE poll_id = ? AND option_id = ? AND user_id = ?", (self.poll_id, self.option_id, uid), fetch=True)
+        if rows:
+            remove_vote(self.poll_id, self.option_id, uid)
+        else:
+            add_vote(self.poll_id, self.option_id, uid)
+        embed = generate_poll_embed_from_db(self.poll_id, interaction.guild)
+        try:
+            new_view = PollView(self.poll_id)
+            bot.add_view(new_view)
+            await interaction.response.edit_message(embed=embed, view=new_view)
+        except Exception:
+            try:
+                await interaction.response.edit_message(embed=embed)
+            except Exception:
+                pass
+
+class AddAvailabilityButton(discord.ui.Button):
+    def __init__(self, poll_id: str):
+        super().__init__(label="🗓️ Verfügbarkeit hinzufügen", style=discord.ButtonStyle.success, custom_id=f"avail:{poll_id}")
+        self.poll_id = poll_id
+    async def callback(self, interaction: discord.Interaction):
+        try:
+            view = AvailabilityDayView(self.poll_id, for_user=interaction.user.id)
+            embed = discord.Embed(
+                title="🗓️ Verfügbarkeit auswählen",
+                description="Wähle Tage und Zeiten aus.",
+                color=discord.Color.green()
+            )
+            await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
+        except Exception:
+            log.exception("Failed opening AvailabilityDayView")
 
 # Edit-own-ideas UI
 class DeleteOwnOptionButtonEphemeral(discord.ui.Button):
