@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 """
 bot.py — Event creation: Single modal with flexible parsing, creates Bot Event only (no Discord Scheduled Event).
-Embed layout adjusted: no confirmation on idea delete, no icons in event embed, added quarterly poll with day-based availability.
+Embed layout adjusted: no confirmation on idea delete, no icons in event embed, matches back in poll embed.
+Daily summary now shows only new matches since last post.
+Added quarterly poll with day-based availability, scheduled and manual command.
 
 Replace your running bot.py with this file and restart the bot.
 """
@@ -1338,6 +1340,15 @@ async def startpoll(ctx):
     except Exception as e:
         log.exception("startpoll failed")
         await ctx.send(f"Fehler beim Erstellen der Umfrage: {e}")
+
+@bot.command()
+async def startquarterlypoll(ctx):
+    try:
+        poll_id = await post_quarterly_poll_to_channel(ctx.channel)
+        # Optional: Bestätigungsnachricht, falls gewünscht
+    except Exception as e:
+        log.exception("startquarterlypoll failed")
+        await ctx.send(f"Fehler beim Erstellen der Quartalsumfrage: {e}")
 
 @bot.command()
 async def listpolls(ctx, limit: int = 50):
