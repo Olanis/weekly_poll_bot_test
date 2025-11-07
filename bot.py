@@ -3,7 +3,7 @@
 bot.py — Event creation: Single modal with flexible parsing, creates Bot Event only (no Discord Scheduled Event).
 Embed layout adjusted: no confirmation on idea delete, no icons in event embed, matches back in poll embed.
 Daily summary now shows only new matches since last post.
-Added quarterly poll with day-based availability, improved navigation within one message, fixed view attribute access.
+Added quarterly poll with day-based availability, improved navigation within one message, fixed view attribute access, added labels for sections.
 
 Replace your running bot.py with this file and restart the bot.
 """
@@ -324,7 +324,7 @@ def remove_vote(poll_id: str, option_id: int, user_id: int):
                (poll_id, option_id, user_id))
 
 def get_votes_for_poll(poll_id: str):
-    return db_execute("SELECT option_id, user_id FROM votes WHERE poll_id = ?", (poll_id,), fetch=True) or []
+    return db_execute("SELECT option_id, user_id FROM votes WHERE poll_id = ?, fetch=True) or []
 
 def persist_availability(poll_id: str, user_id: int, slots: list):
     db_execute("DELETE FROM availability WHERE poll_id = ? AND user_id = ?", (poll_id, user_id))
@@ -692,11 +692,11 @@ class WeekSelectButton(discord.ui.Button):
         self.weeks = weeks
     async def callback(self, interaction: discord.Interaction):
         # Edit message to add days for selected week
-        _, week_start, week_end = self.weeks[self.week_index]
-        days = get_week_days(week_start, week_end)
         months = self.view.months if hasattr(self.view, 'months') else []
         selected_month = self.view.selected_month if hasattr(self.view, 'selected_month') else None
         weeks = self.view.weeks if hasattr(self.view, 'weeks') else []
+        _, week_start, week_end = self.weeks[self.week_index]
+        days = get_week_days(week_start, week_end)
         new_view = QuarterlyAvailabilityView(self.poll_id, selected_month=selected_month, months=months, weeks=weeks, selected_week=self.week_index, days=days)
         embed = discord.Embed(
             title="🗓️ Quartals-Verfügbarkeit auswählen",
@@ -719,12 +719,29 @@ class DayAvailButton(discord.ui.Button):
         user_tmp = _tmp.setdefault(uid, set())
         if self.day in user_tmp:
             user_tmp.remove(self.day)
-            self.style = discord.ButtonStyle.secondary
         else:
             user_tmp.add(self.day)
-            self.style = discord.ButtonStyle.success
+        # Rebuild view with updated state
+        months = self.view.months if hasattr(self.view, 'months') else []
+        selected_month = self.view.selected_month if hasattr(self.view, 'selected_month') else None
+        weeks = self.view.weeks if hasattr(self.view, 'weeks') else []
+        selected_week = self.view.selected_week if hasattr(self.view, 'selected_week') else None
+        days = self.view.days if hasattr(self.view, 'days') else []
+        new_view = QuarterlyAvailabilityView(self.poll_id, selected_month=selected_month, months=months, weeks=weeks, selected_week=selected_week, days=days)
+        # Update the style for the clicked button
+        for item in new_view.children:
+            if isinstance(item, DayAvailButton) and item.day == self.day:
+                if self.day in user_tmp:
+                    item.style = discord.ButtonStyle.success
+                else:
+                    item.style = discord.ButtonStyle.secondary
+        embed = discord.Embed(
+            title="🗓️ Quartals-Verfügbarkeit auswählen",
+            description="Wähle Tage der Woche aus.",
+            color=discord.Color.green()
+        )
         try:
-            await interaction.response.edit_message(view=interaction.message.view)
+            await interaction.response.edit_message(embed=embed, view=new_view)
         except Exception:
             pass
 
@@ -752,30 +769,28 @@ class QuarterlyAvailabilityView(discord.ui.View):
         self.weeks = weeks or []
         self.selected_week = selected_week
         self.days = days or []
-        # Add month buttons
-        for i in range(3):
-            btn = MonthSelectButton(poll_id, i, self.months)
-            if selected_month is not None and i == selected_month:
-                btn.style = discord.ButtonStyle.success
-            self.add_item(btn)
-        # Add week buttons if month selected
+        # Add month label and buttons
+        if self.months:
+            self.add_item(discord.ui.Button(label="Monate:", style=discord.ButtonStyle.secondary, disabled=True))
+            for i in range(3):
+                btn = MonthSelectButton(poll_id, i, self.months)
+                if selected_month is not None and i == selected_month:
+                    btn.style = discord.ButtonStyle.success
+                self.add_item(btn)
+        # Add week label and buttons if month selected
         if weeks:
+            self.add_item(discord.ui.Button(label="Wochen:", style=discord.ButtonStyle.secondary, disabled=True))
             for i, (label, _, _) in enumerate(weeks):
                 btn = WeekSelectButton(poll_id, i, weeks)
                 if selected_week is not None and i == selected_week:
                     btn.style = discord.ButtonStyle.success
                 self.add_item(btn)
-        # Add day buttons if week selected
+        # Add day label and buttons if week selected
         if days:
+            self.add_item(discord.ui.Button(label="Tage:", style=discord.ButtonStyle.secondary, disabled=True))
             for day in days:
                 btn = DayAvailButton(poll_id, day)
-                uid = None  # Assuming for ephemeral, but need to handle
-                if hasattr(self, 'for_user'):
-                    uid = self.for_user
-                if uid:
-                    user_tmp = temp_selections.get(poll_id, {}).get(uid, set())
-                    if day in user_tmp:
-                        btn.style = discord.ButtonStyle.success
+                uid = None  # Can't get uid here, handle in callback
                 self.add_item(btn)
         # Add submit button
         submit = QuarterlySubmitButton(poll_id)
