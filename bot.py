@@ -3,7 +3,7 @@
 bot.py — Event creation: Single modal with flexible parsing, creates Bot Event only (no Discord Scheduled Event).
 Embed layout adjusted: no confirmation on idea delete, no icons in event embed, matches back in poll embed.
 Daily summary now shows only new matches since last post.
-Added quarterly poll with day-based availability, scheduled and manual command.
+Added quarterly poll with day-based availability, improved navigation within one message.
 
 Replace your running bot.py with this file and restart the bot.
 """
@@ -658,7 +658,7 @@ class AvailabilityDayView(discord.ui.View):
         self.add_item(submit)
         self.add_item(remove)
 
-# Quarterly availability
+# Quarterly availability - updated for single message navigation
 class MonthSelectButton(discord.ui.Button):
     def __init__(self, poll_id: str, month_index: int, months: list):
         label = months[month_index]
@@ -668,55 +668,45 @@ class MonthSelectButton(discord.ui.Button):
         self.month_index = month_index
         self.months = months
     async def callback(self, interaction: discord.Interaction):
+        # Edit message to add weeks for selected month
         month_str = self.months[self.month_index]
         weeks = get_month_weeks(month_str)
-        view = WeekSelectView(self.poll_id, weeks)
+        new_view = QuarterlyAvailabilityView(self.poll_id, selected_month=self.month_index, months=self.months, weeks=weeks)
         embed = discord.Embed(
-            title=f"🗓️ Wochen in {month_str}",
-            description="Wähle eine Woche aus.",
-            color=discord.Color.blue()
-        )
-        try:
-            await interaction.response.edit_message(embed=embed, view=view)
-        except Exception:
-            pass
-
-class WeekSelectView(discord.ui.View):
-    def __init__(self, poll_id: str, weeks: list):
-        super().__init__(timeout=None)
-        self.poll_id = poll_id
-        for i, (label, start, end) in enumerate(weeks):
-            btn = WeekButton(poll_id, label, start, end)
-            self.add_item(btn)
-
-class WeekButton(discord.ui.Button):
-    def __init__(self, poll_id: str, label: str, start: date, end: date):
-        super().__init__(label=label, style=discord.ButtonStyle.secondary)
-        self.poll_id = poll_id
-        self.start = start
-        self.end = end
-    async def callback(self, interaction: discord.Interaction):
-        days = get_week_days(self.start, self.end)
-        view = DaySelectView(self.poll_id, days)
-        embed = discord.Embed(
-            title=f"📅 Tage in {self.label}",
-            description="Wähle verfügbare Tage aus.",
+            title="🗓️ Quartals-Verfügbarkeit auswählen",
+            description="Wähle Monate und Wochen des Quartals aus.",
             color=discord.Color.green()
         )
         try:
-            await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
+            await interaction.response.edit_message(embed=embed, view=new_view)
         except Exception:
             pass
 
-class DaySelectView(discord.ui.View):
-    def __init__(self, poll_id: str, days: list):
-        super().__init__(timeout=None)
+class WeekSelectButton(discord.ui.Button):
+    def __init__(self, poll_id: str, week_index: int, weeks: list):
+        label = weeks[week_index][0]
+        custom_id = f"week:{poll_id}:{week_index}"
+        super().__init__(label=label, style=discord.ButtonStyle.secondary, custom_id=custom_id)
         self.poll_id = poll_id
-        for day in days:
-            btn = DayAvailButton(poll_id, day)
-            self.add_item(btn)
-        submit = QuarterlySubmitButton(poll_id)
-        self.add_item(submit)
+        self.week_index = week_index
+        self.weeks = weeks
+    async def callback(self, interaction: discord.Interaction):
+        # Edit message to add days for selected week
+        _, week_start, week_end = self.weeks[self.week_index]
+        days = get_week_days(week_start, week_end)
+        months = getattr(interaction.message.view, 'months', [])
+        selected_month = getattr(interaction.message.view, 'selected_month', None)
+        weeks = getattr(interaction.message.view, 'weeks', [])
+        new_view = QuarterlyAvailabilityView(self.poll_id, selected_month=selected_month, months=months, weeks=weeks, selected_week=self.week_index, days=days)
+        embed = discord.Embed(
+            title="🗓️ Quartals-Verfügbarkeit auswählen",
+            description="Wähle Tage der Woche aus.",
+            color=discord.Color.green()
+        )
+        try:
+            await interaction.response.edit_message(embed=embed, view=new_view)
+        except Exception:
+            pass
 
 class DayAvailButton(discord.ui.Button):
     def __init__(self, poll_id: str, day: str):
@@ -734,7 +724,7 @@ class DayAvailButton(discord.ui.Button):
             user_tmp.add(self.day)
             self.style = discord.ButtonStyle.success
         try:
-            await interaction.response.edit_message(view=self.view)
+            await interaction.response.edit_message(view=interaction.message.view)
         except Exception:
             pass
 
@@ -754,14 +744,42 @@ class QuarterlySubmitButton(discord.ui.Button):
             pass
 
 class QuarterlyAvailabilityView(discord.ui.View):
-    def __init__(self, poll_id: str):
+    def __init__(self, poll_id: str, selected_month: int = None, months: list = None, weeks: list = None, selected_week: int = None, days: list = None):
         super().__init__(timeout=None)
         self.poll_id = poll_id
-        quarter_start = get_current_quarter_start()
-        months = get_quarter_months(quarter_start)
+        self.selected_month = selected_month
+        self.months = months or get_quarter_months(get_current_quarter_start())
+        self.weeks = weeks or []
+        self.selected_week = selected_week
+        self.days = days or []
+        # Add month buttons
         for i in range(3):
-            btn = MonthSelectButton(poll_id, i, months)
+            btn = MonthSelectButton(poll_id, i, self.months)
+            if selected_month is not None and i == selected_month:
+                btn.style = discord.ButtonStyle.success
             self.add_item(btn)
+        # Add week buttons if month selected
+        if weeks:
+            for i, (label, _, _) in enumerate(weeks):
+                btn = WeekSelectButton(poll_id, i, weeks)
+                if selected_week is not None and i == selected_week:
+                    btn.style = discord.ButtonStyle.success
+                self.add_item(btn)
+        # Add day buttons if week selected
+        if days:
+            for day in days:
+                btn = DayAvailButton(poll_id, day)
+                uid = None  # Assuming for ephemeral, but need to handle
+                if hasattr(self, 'for_user'):
+                    uid = self.for_user
+                if uid:
+                    user_tmp = temp_selections.get(poll_id, {}).get(uid, set())
+                    if day in user_tmp:
+                        btn.style = discord.ButtonStyle.success
+                self.add_item(btn)
+        # Add submit button
+        submit = QuarterlySubmitButton(poll_id)
+        self.add_item(submit)
 
 # Edit-own-ideas UI
 class DeleteOwnOptionButtonEphemeral(discord.ui.Button):
