@@ -1,9 +1,7 @@
 #!/usr/bin/env python3
 """
 bot.py — Event creation: Single modal with flexible parsing, creates Bot Event only (no Discord Scheduled Event).
-Embed layout adjusted with minimal spacing, no confirmation message, fixed HourButton callback.
-Added match selection before event creation, with pre-filling and auto-interest for match users.
-Modal closes after event creation.
+Embed layout adjusted: no poll confirmation, no timestamp, no calendar icon in title, match selection as dropdown with details.
 
 Replace your running bot.py with this file and restart the bot.
 """
@@ -325,9 +323,8 @@ def generate_poll_embed_from_db(poll_id: str, guild: Optional[discord.Guild] = N
         votes_map.setdefault(opt_id, []).append(uid)
     embed = discord.Embed(
         title="📋 Worauf hast du diese Woche Lust?",
-        description="Gib eigene Ideen ein, stimme ab oder trage deine Zeiten ein!",
-        color=discord.Color.blurple(),
-        timestamp=datetime.now(timezone.utc)
+        description="Gib eigene Ideen ein, stimme ab oder trage deine Zeiten ein!"
+        # Removed timestamp
     )
     for opt_id, opt_text, _created, author_id in options:
         voters = votes_map.get(opt_id, [])
@@ -626,14 +623,51 @@ class OpenEditOwnIdeasButton(discord.ui.Button):
             pass
 
 # Match selection and event creation
-class SelectMatchView(discord.ui.View):
-    def __init__(self, poll_id: str, matches: dict, user_id: int):
-        super().__init__(timeout=None)
+class MatchSelect(discord.ui.Select):
+    def __init__(self, poll_id: str, matches: dict):
+        options = []
         self.poll_id = poll_id
-        self.user_id = user_id
+        self.matches = matches
         for option_text, infos in matches.items():
-            btn = MatchButton(poll_id, option_text, infos, user_id)
-            self.add_item(btn)
+            for info in infos:
+                slot = info["slot"]
+                users = info["users"]
+                day, hour_s = slot.split("-")
+                hour = int(hour_s)
+                time_str = slot_label_range(day, hour)
+                user_names = " ".join([user_display_name(None, u) for u in users])
+                label = f"{option_text[:50]} | {time_str} | {user_names[:50]}"
+                value = f"{option_text}|{slot}"
+                options.append(discord.SelectOption(label=label, value=value))
+        if options:
+            super().__init__(placeholder="Wähle ein Match aus...", options=options)
+        else:
+            super().__init__(placeholder="Keine Matches verfügbar", options=[], disabled=True)
+        self.callback = self.select_match
+
+    async def select_match(self, interaction: discord.Interaction):
+        selected = self.values[0] if self.values else None
+        if not selected:
+            return
+        option_text, slot = selected.split("|", 1)
+        day, hour_s = slot.split("-")
+        hour = int(hour_s)
+        date_next = next_date_for_day_short(day)
+        start_dt = datetime.combine(date_next, _time(hour, 0))
+        end_dt = start_dt + timedelta(hours=1)
+        date_str = start_dt.strftime("%d.%m.%Y")
+        time_str = f"{hour:02d}:00 - {(hour+1)%24:02d}:00"
+        modal = CreateEventModal(self.poll_id, prefill_title=option_text, prefill_date=date_str, prefill_time=time_str)
+        try:
+            await interaction.response.send_modal(modal)
+        except Exception:
+            log.exception("Failed to send prefilled CreateEventModal")
+
+class SelectMatchView(discord.ui.View):
+    def __init__(self, poll_id: str, matches: dict):
+        super().__init__(timeout=None)
+        select = MatchSelect(poll_id, matches)
+        self.add_item(select)
         new_btn = discord.ui.Button(label="📅 Neues Event erstellen", style=discord.ButtonStyle.primary)
         new_btn.callback = self.create_new_event
         self.add_item(new_btn)
@@ -645,22 +679,6 @@ class SelectMatchView(discord.ui.View):
         except Exception:
             log.exception("Failed to send CreateEventModal")
 
-class MatchButton(discord.ui.Button):
-    def __init__(self, poll_id: str, option_text: str, infos: list, user_id: int):
-        label = option_text[:80] + "..." if len(option_text) > 80 else option_text
-        super().__init__(label=label, style=discord.ButtonStyle.secondary)
-        self.poll_id = poll_id
-        self.option_text = option_text
-        self.infos = infos
-        self.user_id = user_id
-    async def callback(self, interaction: discord.Interaction):
-        # Pre-fill modal with match data
-        modal = CreateEventModal(self.poll_id, prefill_title=self.option_text, match_users=[u for info in self.infos for u in info["users"]])
-        try:
-            await interaction.response.send_modal(modal)
-        except Exception:
-            log.exception("Failed to send prefilled CreateEventModal")
-
 # Event creation: Single modal with flexible parsing, creates Bot Event only (no Discord Scheduled Event).
 class CreateEventModal(discord.ui.Modal, title="Event erstellen"):
     title_field = discord.ui.TextInput(label="Titel", style=discord.TextStyle.short, max_length=100)
@@ -669,13 +687,15 @@ class CreateEventModal(discord.ui.Modal, title="Event erstellen"):
     time_range_field = discord.ui.TextInput(label="Zeitbereich", style=discord.TextStyle.short, placeholder="18:00 - 20:00", max_length=20)
     location_field = discord.ui.TextInput(label="Ort", style=discord.TextStyle.short, placeholder="#channelname oder Text", max_length=200)
 
-    def __init__(self, poll_id: str, prefill_title: str = "", match_users: list = None):
+    def __init__(self, poll_id: str, prefill_title: str = "", prefill_date: str = "", prefill_time: str = ""):
         super().__init__(title="Event erstellen")
         self.poll_id = poll_id
-        self.prefill_title = prefill_title
-        self.match_users = match_users or []
         if prefill_title:
             self.title_field.default = prefill_title
+        if prefill_date:
+            self.date_range_field.default = prefill_date
+        if prefill_time:
+            self.time_range_field.default = prefill_time
 
     async def on_submit(self, interaction: discord.Interaction):
         await interaction.response.defer()  # Close modal
@@ -720,13 +740,6 @@ class CreateEventModal(discord.ui.Modal, title="Event erstellen"):
                     pass
                 return
 
-            # Add match users as interested
-            for uid in self.match_users:
-                try:
-                    db_execute("INSERT OR IGNORE INTO created_event_rsvps(event_id, user_id) VALUES (?, ?)", (event_id, uid))
-                except Exception:
-                    log.exception(f"Failed adding match user {uid} to RSVPs")
-
             # automatically add creator as interested
             try:
                 creator_uid = interaction.user.id
@@ -750,7 +763,7 @@ class CreateEventModal(discord.ui.Modal, title="Event erstellen"):
 
             # Create Embed resembling official Discord Server Event
             embed = discord.Embed(
-                title=f"📅 {title}",
+                title=title,  # Removed calendar icon
                 description=description if description else None,  # No description if empty
                 color=discord.Color.blue()
                 # No timestamp
@@ -819,7 +832,7 @@ class CreateEventButton(discord.ui.Button):
     async def callback(self, interaction: discord.Interaction):
         matches = compute_matches_for_poll_from_db(self.poll_id)
         if matches:
-            view = SelectMatchView(self.poll_id, matches, interaction.user.id)
+            view = SelectMatchView(self.poll_id, matches)
             embed = discord.Embed(
                 title="🎯 Event aus Match erstellen",
                 description="Wähle ein bestehendes Match aus, um ein Event vorzubefüllen, oder erstelle ein neues.",
@@ -847,7 +860,7 @@ async def build_created_event_embed(event_id: str, guild: Optional[discord.Guild
         return discord.Embed(title="Event", description="(Details fehlen)", color=discord.Color.dark_grey())
     title, description, start_iso, end_iso, participants_text, location = rows[0]
     embed = discord.Embed(
-        title=f"📅 {title}",
+        title=title,  # Removed calendar icon
         description=description if description else None,
         color=discord.Color.blue()
     )
@@ -1070,7 +1083,7 @@ async def _created_event_reminder_coro(event_id: str, channel_id: int, hours_bef
             delta = sdt - now_local
             hours_left = int(delta.total_seconds() // 3600)
             new_title = embed.title or "Event"
-            embed.title = f"📣 starts in ~{hours_left}h — {new_title.lstrip('📅 ').strip()}"
+            embed.title = f"📣 starts in ~{hours_left}h — {new_title}"
         except Exception:
             pass
     view = EventSignupView(event_id)
@@ -1104,7 +1117,7 @@ async def post_poll_to_channel(channel: discord.abc.Messageable):
 async def startpoll(ctx):
     try:
         poll_id = await post_poll_to_channel(ctx.channel)
-        await ctx.send(f"Poll gepostet (id via !listpolls)", delete_after=8)
+        # Removed confirmation message
     except Exception as e:
         log.exception("startpoll failed")
         await ctx.send(f"Fehler beim Erstellen der Umfrage: {e}")
