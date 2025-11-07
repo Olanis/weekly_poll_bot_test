@@ -3,7 +3,7 @@
 bot.py — Event creation: Single modal with flexible parsing, creates Bot Event only (no Discord Scheduled Event).
 Embed layout adjusted: no confirmation on idea delete, no icons in event embed, matches back in poll embed.
 Daily summary now shows only new matches since last post.
-Added quarterly poll with day-based availability, improved navigation within one message, fixed view attribute access, added labels for sections, fixed PollView definition.
+Added quarterly poll with day-based availability, improved navigation within one message, fixed view attribute access, added labels for sections, fixed PollView definition, fixed day selection persistence.
 
 Replace your running bot.py with this file and restart the bot.
 """
@@ -698,6 +698,15 @@ class WeekSelectButton(discord.ui.Button):
         _, week_start, week_end = self.weeks[self.week_index]
         days = get_week_days(week_start, week_end)
         new_view = QuarterlyAvailabilityView(self.poll_id, selected_month=selected_month, months=months, weeks=weeks, selected_week=self.week_index, days=days)
+        # Set styles for day buttons based on user selections
+        uid = interaction.user.id
+        user_tmp = temp_selections.get(self.poll_id, {}).get(uid, set())
+        for item in new_view.children:
+            if isinstance(item, DayAvailButton):
+                if item.day in user_tmp:
+                    item.style = discord.ButtonStyle.success
+                else:
+                    item.style = discord.ButtonStyle.secondary
         embed = discord.Embed(
             title="🗓️ Quartals-Verfügbarkeit auswählen",
             description="Wähle Tage der Woche aus.",
