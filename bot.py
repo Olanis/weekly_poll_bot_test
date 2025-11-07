@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 bot.py — Event creation: Single modal with flexible parsing, creates Bot Event only (no Discord Scheduled Event).
-Embed layout adjusted: no poll confirmation, no timestamp, no calendar icon in title, match selection as dropdown with details.
+Embed layout adjusted: no poll confirmation, no timestamp, no calendar icon in title, match selection as dropdown with details, matches back in poll embed.
 
 Replace your running bot.py with this file and restart the bot.
 """
@@ -103,6 +103,13 @@ def init_db():
             event_id TEXT NOT NULL,
             user_id INTEGER NOT NULL,
             UNIQUE(event_id, user_id)
+        )
+    """)
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS last_posted_matches (
+            poll_id TEXT PRIMARY KEY,
+            matches TEXT NOT NULL,
+            updated_at TEXT NOT NULL
         )
     """)
     con.commit()
@@ -314,6 +321,20 @@ def compute_matches_for_poll_from_db(poll_id: str):
             best = [info for info in common_slots if len(info["users"]) == max_count]
             results[opt_text] = best
     return results
+
+def get_last_posted_matches(poll_id: str):
+    rows = db_execute("SELECT matches FROM last_posted_matches WHERE poll_id = ?", (poll_id,), fetch=True)
+    if rows:
+        import json
+        return json.loads(rows[0][0])
+    return {}
+
+def set_last_posted_matches(poll_id: str, matches: dict):
+    import json
+    matches_str = json.dumps(matches)
+    now = datetime.now(timezone.utc).isoformat()
+    db_execute("INSERT OR REPLACE INTO last_posted_matches(poll_id, matches, updated_at) VALUES (?, ?, ?)",
+               (poll_id, matches_str, now))
 
 def generate_poll_embed_from_db(poll_id: str, guild: Optional[discord.Guild] = None):
     options = get_options(poll_id)
@@ -576,7 +597,7 @@ class DeleteOwnOptionButtonEphemeral(discord.ui.Button):
                                     bot.add_view(PollView(poll_id))
                                 except Exception:
                                     pass
-                                await msg.edit(embed=new_embed, view=PollView(poll_id))
+                                await msg.edit(embed=embed, view=PollView(poll_id))
                             break
         except Exception:
             log.exception("Failed best-effort poll update on delete")
@@ -1175,8 +1196,21 @@ async def post_daily_summary_to(channel: discord.TextChannel):
     tz = ZoneInfo(POST_TIMEZONE)
     since = datetime.now(tz=tz) - timedelta(days=1)
     new_options = get_options_since(poll_id, since)
-    matches = compute_matches_for_poll_from_db(poll_id)
-    if (not new_options) and (not matches):
+    current_matches = compute_matches_for_poll_from_db(poll_id)
+    last_matches = get_last_posted_matches(poll_id)
+    new_matches = {}
+    for key, infos in current_matches.items():
+        if key not in last_matches:
+            new_matches[key] = infos
+        else:
+            # Check if new infos
+            last_infos = last_matches[key]
+            for info in infos:
+                if info not in last_infos:
+                    if key not in new_matches:
+                        new_matches[key] = []
+                    new_matches[key].append(info)
+    if (not new_options) and (not new_matches):
         return
     embed = discord.Embed(title="🗓️ Tages-Update: Matches & neue Ideen", color=discord.Color.green(), timestamp=datetime.now(tz=tz))
     if new_options:
@@ -1191,8 +1225,8 @@ async def post_daily_summary_to(channel: discord.TextChannel):
         embed.add_field(name="🆕 Neue Ideen", value="\n".join(lines), inline=False)
     else:
         embed.add_field(name="🆕 Neue Ideen", value="Keine", inline=False)
-    if matches:
-        for opt_text, infos in matches.items():
+    if new_matches:
+        for opt_text, infos in new_matches.items():
             lines = []
             for info in infos:
                 slot = info["slot"]
@@ -1201,9 +1235,9 @@ async def post_daily_summary_to(channel: discord.TextChannel):
                 timestr = slot_label_range(day, hour)
                 names = [user_display_name(channel.guild if isinstance(channel, discord.TextChannel) else None, u) for u in info["users"]]
                 lines.append(f"{timestr}: {', '.join(names)}")
-            embed.add_field(name=f"🤝 Matches — {opt_text}", value="\n".join(lines), inline=False)
+            embed.add_field(name=f"🤝 Neue Matches — {opt_text}", value="\n".join(lines), inline=False)
     else:
-        embed.add_field(name="🤝 Matches", value="Keine gemeinsamen Zeiten für Optionen mit ≥2 Stimmen.", inline=False)
+        embed.add_field(name="🤝 Neue Matches", value="Keine neuen gemeinsamen Zeiten seit dem letzten Update.", inline=False)
     voter_rows = db_execute("SELECT DISTINCT user_id FROM votes WHERE poll_id = ?", (poll_id,), fetch=True)
     voters = [r[0] for r in voter_rows] if voter_rows else []
     avail_rows = db_execute("SELECT DISTINCT user_id FROM availability WHERE poll_id = ?", (poll_id,), fetch=True)
@@ -1233,8 +1267,9 @@ async def post_daily_summary_to(channel: discord.TextChannel):
     sent = await channel.send(embed=embed)
     try:
         set_last_daily_summary(channel.id, sent.id)
+        set_last_posted_matches(poll_id, current_matches)
     except Exception:
-        log.exception("Failed saving daily summary id")
+        log.exception("Failed saving daily summary id or last matches")
 
 # Scheduler helpers & startup
 def job_post_weekly():
