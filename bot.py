@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 bot.py — Event creation: Single modal with flexible parsing, creates Bot Event only (no Discord Scheduled Event).
-Embed layout adjusted: no poll confirmation, no timestamp, no calendar icon in title, match selection as dropdown with details, matches back in poll embed.
+Embed layout adjusted: normal spacing, matches back in poll embed.
 
 Replace your running bot.py with this file and restart the bot.
 """
@@ -597,7 +597,7 @@ class DeleteOwnOptionButtonEphemeral(discord.ui.Button):
                                     bot.add_view(PollView(poll_id))
                                 except Exception:
                                     pass
-                                await msg.edit(embed=embed, view=PollView(poll_id))
+                                await msg.edit(embed=new_embed, view=PollView(poll_id))
                             break
         except Exception:
             log.exception("Failed best-effort poll update on delete")
@@ -684,21 +684,24 @@ class MatchSelect(discord.ui.Select):
         except Exception:
             log.exception("Failed to send prefilled CreateEventModal")
 
-class SelectMatchView(discord.ui.View):
-    def __init__(self, poll_id: str, matches: dict):
-        super().__init__(timeout=None)
-        select = MatchSelect(poll_id, matches)
-        self.add_item(select)
-        new_btn = discord.ui.Button(label="📅 Neues Event erstellen", style=discord.ButtonStyle.primary)
-        new_btn.callback = self.create_new_event
-        self.add_item(new_btn)
-
-    async def create_new_event(self, interaction: discord.Interaction):
+class NewEventButton(discord.ui.Button):
+    def __init__(self, poll_id: str):
+        super().__init__(label="📅 Neues Event erstellen", style=discord.ButtonStyle.primary)
+        self.poll_id = poll_id
+    async def callback(self, interaction: discord.Interaction):
         modal = CreateEventModal(self.poll_id)
         try:
             await interaction.response.send_modal(modal)
         except Exception:
             log.exception("Failed to send CreateEventModal")
+
+class SelectMatchView(discord.ui.View):
+    def __init__(self, poll_id: str, matches: dict):
+        super().__init__(timeout=None)
+        select = MatchSelect(poll_id, matches)
+        self.add_item(select)
+        new_btn = NewEventButton(poll_id)
+        self.add_item(new_btn)
 
 # Event creation: Single modal with flexible parsing, creates Bot Event only (no Discord Scheduled Event).
 class CreateEventModal(discord.ui.Modal, title="Event erstellen"):
@@ -789,10 +792,9 @@ class CreateEventModal(discord.ui.Modal, title="Event erstellen"):
                 color=discord.Color.blue()
                 # No timestamp
             )
-            embed.set_thumbnail(url=interaction.guild.icon.url if interaction.guild and interaction.guild.icon else None)  # Server logo
+            embed.set_thumbnail(url=interaction.guild.icon.url if interaction.guild and interaction.guild.icon else None)  # Server logo (size not controllable in embeds)
 
-            # Minimal larger spacing: use a small text spacer
-            embed.add_field(name=" ", value=" ", inline=False)
+            # Normal spacing (removed extra spacer)
 
             # Grouped Date/Time
             start_str = start_dt.strftime("%d.%m.%y %H:%M")
@@ -886,7 +888,7 @@ async def build_created_event_embed(event_id: str, guild: Optional[discord.Guild
         color=discord.Color.blue()
     )
     embed.set_thumbnail(url=guild.icon.url if guild and guild.icon else None)
-    embed.add_field(name=" ", value=" ", inline=False)  # Minimal larger spacing
+    # Normal spacing
     if start_iso:
         try:
             start_dt = datetime.fromisoformat(start_iso)
