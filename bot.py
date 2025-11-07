@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-bot.py — Event creation: Single modal with 5 fields: Titel, Beschreibung, Datumsbereich, Zeitbereich, Ort.
-Parses combined ranges and creates event directly.
+bot.py — Event creation: Single modal with flexible parsing for date/time ranges.
+Supports shorthand inputs: e.g., "01.05." -> "01.05.2025 - 01.05.2025", "9-10" -> "09:00 - 10:00".
 
 Replace your running bot.py with this file and restart the bot.
 """
@@ -14,7 +14,7 @@ import asyncio
 import logging
 from datetime import datetime, timedelta, timezone, date, time as _time
 from zoneinfo import ZoneInfo
-from typing import Optional, List, Dict, Set
+from typing import Optional, List, Dict, Set, Tuple
 
 import discord
 from discord.ext import commands
@@ -182,6 +182,56 @@ def parse_time_hhmm(s: str) -> Optional[_time]:
         return _time(hh, mm)
     except Exception:
         return None
+
+def parse_date_range(date_range_str: str) -> Tuple[Optional[date], Optional[date]]:
+    """
+    Parse a date range string like "01.01.2026 - 02.01.2026" or shorthand "01.05." -> "01.05.2025 - 01.05.2025".
+    Returns (start_date, end_date) or (None, None) on error.
+    """
+    date_range_str = date_range_str.strip()
+    parts = [p.strip() for p in date_range_str.split("-")]
+    if len(parts) == 1:
+        # Single date: use as start and end
+        single_date_str = parts[0]
+        if not single_date_str:
+            return None, None
+        # If no year, add current year
+        if single_date_str.count(".") == 1:  # e.g., "01.05"
+            current_year = datetime.now().year
+            single_date_str += f".{current_year}"
+        start_date = parse_date_ddmmyyyy(single_date_str)
+        end_date = start_date
+    elif len(parts) == 2:
+        start_str, end_str = parts
+        # If no year, add current year
+        if start_str.count(".") == 1:
+            start_str += f".{datetime.now().year}"
+        if end_str.count(".") == 1:
+            end_str += f".{datetime.now().year}"
+        start_date = parse_date_ddmmyyyy(start_str)
+        end_date = parse_date_ddmmyyyy(end_str)
+    else:
+        return None, None
+    return start_date, end_date
+
+def parse_time_range(time_range_str: str) -> Tuple[Optional[_time], Optional[_time]]:
+    """
+    Parse a time range string like "18:00 - 20:00" or shorthand "9-10" -> "09:00 - 10:00".
+    Returns (start_time, end_time) or (None, None) on error.
+    """
+    time_range_str = time_range_str.strip()
+    parts = [p.strip() for p in time_range_str.split("-")]
+    if len(parts) != 2:
+        return None, None
+    start_str, end_str = parts
+    # If only numbers, add :00
+    if start_str.isdigit():
+        start_str += ":00"
+    if end_str.isdigit():
+        end_str += ":00"
+    start_time = parse_time_hhmm(start_str)
+    end_time = parse_time_hhmm(end_str)
+    return start_time, end_time
 
 # -------------------------
 # Poll persistence helpers
@@ -595,38 +645,14 @@ class CreateEventModal(discord.ui.Modal, title="Event erstellen"):
                     log.exception("Failed to send required fields message")
                 return
 
-            # Parse date range: e.g. "01.01.2026 - 02.01.2026"
-            date_parts = [p.strip() for p in date_range_str.split("-")]
-            if len(date_parts) != 2:
-                try:
-                    await interaction.response.send_message("Datumsbereich muss Format 'DD.MM.YYYY - DD.MM.YYYY' haben.", ephemeral=True)
-                except Exception:
-                    log.exception("Failed to send date parse error")
-                return
-            start_date = parse_date_ddmmyyyy(date_parts[0])
-            end_date = parse_date_ddmmyyyy(date_parts[1])
-            if not start_date or not end_date:
-                try:
-                    await interaction.response.send_message("Datum konnte nicht geparst werden. Verwende DD.MM.YYYY.", ephemeral=True)
-                except Exception:
-                    log.exception("Failed to send date parse error")
-                return
+            start_date, end_date = parse_date_range(date_range_str)
+            start_time, end_time = parse_time_range(time_range_str)
 
-            # Parse time range: e.g. "18:00 - 20:00"
-            time_parts = [p.strip() for p in time_range_str.split("-")]
-            if len(time_parts) != 2:
+            if not start_date or not end_date or not start_time or not end_time:
                 try:
-                    await interaction.response.send_message("Zeitbereich muss Format 'HH:MM - HH:MM' haben.", ephemeral=True)
+                    await interaction.response.send_message("Datums-/Zeitbereich konnte nicht geparst werden. Verwende DD.MM.YYYY für Datum und HH:MM für Zeit.", ephemeral=True)
                 except Exception:
-                    log.exception("Failed to send time parse error")
-                return
-            start_time = parse_time_hhmm(time_parts[0])
-            end_time = parse_time_hhmm(time_parts[1])
-            if not start_time or not end_time:
-                try:
-                    await interaction.response.send_message("Zeit konnte nicht geparst werden. Verwende HH:MM.", ephemeral=True)
-                except Exception:
-                    log.exception("Failed to send time parse error")
+                    log.exception("Failed to send parsing error")
                 return
 
             tz = ZoneInfo(POST_TIMEZONE)
