@@ -728,10 +728,10 @@ class DayAvailButton(discord.ui.Button):
         selected_week = self.view.selected_week if hasattr(self.view, 'selected_week') else None
         days = self.view.days if hasattr(self.view, 'days') else []
         new_view = QuarterlyAvailabilityView(self.poll_id, selected_month=selected_month, months=months, weeks=weeks, selected_week=selected_week, days=days)
-        # Update the style for the clicked button
+        # Update the styles for all day buttons based on user_tmp
         for item in new_view.children:
-            if isinstance(item, DayAvailButton) and item.day == self.day:
-                if self.day in user_tmp:
+            if isinstance(item, DayAvailButton):
+                if item.day in user_tmp:
                     item.style = discord.ButtonStyle.success
                 else:
                     item.style = discord.ButtonStyle.secondary
