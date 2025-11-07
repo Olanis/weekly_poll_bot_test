@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-bot.py — Event creation: Single modal with flexible parsing, attempts to create Discord Guild Scheduled Event if supported.
-Falls back to bot event only if Scheduled Events not available in discord.py version.
+bot.py — Event creation: Single modal with flexible parsing, creates Discord Guild Scheduled Event directly (no version check).
+Falls Scheduled Events nicht verfügbar, schlägt die Erstellung fehl und es wird nur das Bot-Event erstellt.
 
 Replace your running bot.py with this file and restart the bot.
 """
@@ -17,7 +17,6 @@ from zoneinfo import ZoneInfo
 from typing import Optional, List, Dict, Set, Tuple
 
 import discord
-print(f"Discord.py Version: {discord.__version__}")
 from discord.ext import commands
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
@@ -680,7 +679,7 @@ class CreateEventModal(discord.ui.Modal, title="Event erstellen"):
             except Exception:
                 log.exception("Failed adding creator to RSVPs")
 
-            # Create Discord Guild Scheduled Event (with fallback if not supported)
+            # Create Discord Guild Scheduled Event (direct, no version check)
             try:
                 scheduled_event = await create_guild_scheduled_event(interaction.guild, title, description, start_dt, end_dt, location)
                 event_link = f"https://discord.com/events/{interaction.guild.id}/{scheduled_event.id}" if scheduled_event else None
@@ -749,74 +748,56 @@ class CreateEventModal(discord.ui.Modal, title="Event erstellen"):
             except Exception:
                 pass
 
-# Helper function to create Guild Scheduled Event (with version check)
+# Helper function to create Guild Scheduled Event (direct)
 async def create_guild_scheduled_event(guild: discord.Guild, name: str, description: str, start_dt: datetime, end_dt: datetime, location: str) -> Optional[discord.ScheduledEvent]:
     """
     Creates a Guild Scheduled Event. Requires Manage Events permission.
     If location starts with '#', tries to bind to voice channel; else external.
-    Falls back to None if Scheduled Events not supported in this discord.py version.
     """
-    try:
-        # Check if ScheduledEventEntityType exists (discord.py 2.0+)
-        entity_type_class = getattr(discord, 'ScheduledEventEntityType', None)
-        if entity_type_class is None:
-            log.warning("Scheduled Events not supported in this discord.py version. Skipping Discord Event creation.")
-            return None
+    if not guild.me.guild_permissions.manage_events:
+        raise PermissionError("Bot benötigt Manage Events Berechtigung.")
 
-        if not guild.me.guild_permissions.manage_events:
-            raise PermissionError("Bot benötigt Manage Events Berechtigung.")
-
-        external_type = getattr(entity_type_class, 'external', None)
-        voice_type = getattr(entity_type_class, 'voice', None)
-        stage_type = getattr(entity_type_class, 'stage_instance', None)
-        if not external_type:
-            log.warning("ScheduledEventEntityType.external not available. Skipping.")
-            return None
-
-        if location.startswith("#"):
-            # Try to find voice/stage channel
-            channel_name = location[1:].strip()  # remove #
-            channel = None
-            for ch in guild.channels:
-                if ch.name.lower() == channel_name.lower() and isinstance(ch, (discord.VoiceChannel, discord.StageChannel)):
-                    channel = ch
-                    break
-            if channel and voice_type:
-                event = await guild.create_scheduled_event(
-                    name=name,
-                    start_time=start_dt,
-                    end_time=end_dt,
-                    description=description or None,
-                    channel=channel,
-                    privacy_level=discord.PrivacyLevel.guild_only,
-                    entity_type=stage_type if isinstance(channel, discord.StageChannel) else voice_type
-                )
-            else:
-                # Fallback to external
-                event = await guild.create_scheduled_event(
-                    name=name,
-                    start_time=start_dt,
-                    end_time=end_dt,
-                    description=description or None,
-                    privacy_level=discord.PrivacyLevel.guild_only,
-                    entity_type=external_type,
-                    location=location
-                )
+    if location.startswith("#"):
+        # Try to find voice/stage channel
+        channel_name = location[1:].strip()  # remove #
+        channel = None
+        for ch in guild.channels:
+            if ch.name.lower() == channel_name.lower() and isinstance(ch, (discord.VoiceChannel, discord.StageChannel)):
+                channel = ch
+                break
+        if channel:
+            event = await guild.create_scheduled_event(
+                name=name,
+                start_time=start_dt,
+                end_time=end_dt,
+                description=description or None,
+                channel=channel,
+                privacy_level=discord.PrivacyLevel.guild_only,
+                entity_type=discord.ScheduledEventEntityType.stage_instance if isinstance(channel, discord.StageChannel) else discord.ScheduledEventEntityType.voice
+            )
         else:
-            # External event
+            # Fallback to external
             event = await guild.create_scheduled_event(
                 name=name,
                 start_time=start_dt,
                 end_time=end_dt,
                 description=description or None,
                 privacy_level=discord.PrivacyLevel.guild_only,
-                entity_type=external_type,
+                entity_type=discord.ScheduledEventEntityType.external,
                 location=location
             )
-        return event
-    except Exception:
-        log.exception("Error creating Guild Scheduled Event")
-        return None
+    else:
+        # External event
+        event = await guild.create_scheduled_event(
+            name=name,
+            start_time=start_dt,
+            end_time=end_dt,
+            description=description or None,
+            privacy_level=discord.PrivacyLevel.guild_only,
+            entity_type=discord.ScheduledEventEntityType.external,
+            location=location
+        )
+    return event
 
 # Simplified event creation buttons
 class CreateEventButton(discord.ui.Button):
@@ -1303,4 +1284,3 @@ if __name__ == "__main__":
         raise SystemExit(1)
     init_db()
     bot.run(BOT_TOKEN)
-
