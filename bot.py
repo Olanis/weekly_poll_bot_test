@@ -1,8 +1,7 @@
 #!/usr/bin/env python3
 """
-bot.py — Event creation reduced to single modal with fields: Titel, Datum, Beginn, Ende, Ort.
-Uses TextInputs only (no native pickers in modals); user enters date/time manually (DD.MM.YYYY, HH:MM), location as text (e.g., #channelname).
-Directly creates event on submit without steps.
+bot.py — Event creation: Single modal with 5 fields: Titel, Beschreibung, Datumsbereich, Zeitbereich, Ort.
+Parses combined ranges and creates event directly.
 
 Replace your running bot.py with this file and restart the bot.
 """
@@ -569,12 +568,12 @@ class OpenEditOwnIdeasButton(discord.ui.Button):
         except Exception:
             pass
 
-# Event creation: Single modal with Titel, Datum, Beginn, Ende, Ort (all TextInputs)
+# Event creation: Single modal with Titel, Beschreibung, Datumsbereich, Zeitbereich, Ort
 class CreateEventModal(discord.ui.Modal, title="Event erstellen"):
     title_field = discord.ui.TextInput(label="Titel", style=discord.TextStyle.short, max_length=100)
-    date_field = discord.ui.TextInput(label="Datum", style=discord.TextStyle.short, placeholder="01.01.2026", max_length=20)
-    start_field = discord.ui.TextInput(label="Beginn", style=discord.TextStyle.short, placeholder="18:00", max_length=8)
-    end_field = discord.ui.TextInput(label="Ende", style=discord.TextStyle.short, placeholder="20:00", max_length=8)
+    description_field = discord.ui.TextInput(label="Beschreibung", style=discord.TextStyle.long, required=False, max_length=2000)
+    date_range_field = discord.ui.TextInput(label="Datumsbereich", style=discord.TextStyle.short, placeholder="01.01.2026 - 02.01.2026", max_length=40)
+    time_range_field = discord.ui.TextInput(label="Zeitbereich", style=discord.TextStyle.short, placeholder="18:00 - 20:00", max_length=20)
     location_field = discord.ui.TextInput(label="Ort", style=discord.TextStyle.short, placeholder="#channelname oder Text", max_length=200)
 
     def __init__(self, poll_id: str):
@@ -584,38 +583,61 @@ class CreateEventModal(discord.ui.Modal, title="Event erstellen"):
     async def on_submit(self, interaction: discord.Interaction):
         try:
             title = str(self.title_field.value).strip()
-            date_str = str(self.date_field.value).strip()
-            start_time_str = str(self.start_field.value).strip()
-            end_time_str = str(self.end_field.value).strip()
+            description = str(self.description_field.value).strip()
+            date_range_str = str(self.date_range_field.value).strip()
+            time_range_str = str(self.time_range_field.value).strip()
             location = str(self.location_field.value).strip()
 
-            if not title or not date_str or not start_time_str or not end_time_str:
+            if not title or not date_range_str or not time_range_str:
                 try:
-                    await interaction.response.send_message("Alle Felder außer Ort sind erforderlich.", ephemeral=True)
+                    await interaction.response.send_message("Titel, Datumsbereich und Zeitbereich sind erforderlich.", ephemeral=True)
                 except Exception:
                     log.exception("Failed to send required fields message")
                 return
 
-            date_parsed = parse_date_ddmmyyyy(date_str)
-            start_time = parse_time_hhmm(start_time_str)
-            end_time = parse_time_hhmm(end_time_str)
-
-            if not date_parsed or not start_time or not end_time:
+            # Parse date range: e.g. "01.01.2026 - 02.01.2026"
+            date_parts = [p.strip() for p in date_range_str.split("-")]
+            if len(date_parts) != 2:
                 try:
-                    await interaction.response.send_message("Datum/Uhrzeit konnte nicht geparst. Bitte benutze DD.MM.YYYY und HH:MM.", ephemeral=True)
+                    await interaction.response.send_message("Datumsbereich muss Format 'DD.MM.YYYY - DD.MM.YYYY' haben.", ephemeral=True)
                 except Exception:
-                    log.exception("Failed to send invalid-date ephemeral")
+                    log.exception("Failed to send date parse error")
+                return
+            start_date = parse_date_ddmmyyyy(date_parts[0])
+            end_date = parse_date_ddmmyyyy(date_parts[1])
+            if not start_date or not end_date:
+                try:
+                    await interaction.response.send_message("Datum konnte nicht geparst werden. Verwende DD.MM.YYYY.", ephemeral=True)
+                except Exception:
+                    log.exception("Failed to send date parse error")
+                return
+
+            # Parse time range: e.g. "18:00 - 20:00"
+            time_parts = [p.strip() for p in time_range_str.split("-")]
+            if len(time_parts) != 2:
+                try:
+                    await interaction.response.send_message("Zeitbereich muss Format 'HH:MM - HH:MM' haben.", ephemeral=True)
+                except Exception:
+                    log.exception("Failed to send time parse error")
+                return
+            start_time = parse_time_hhmm(time_parts[0])
+            end_time = parse_time_hhmm(time_parts[1])
+            if not start_time or not end_time:
+                try:
+                    await interaction.response.send_message("Zeit konnte nicht geparst werden. Verwende HH:MM.", ephemeral=True)
+                except Exception:
+                    log.exception("Failed to send time parse error")
                 return
 
             tz = ZoneInfo(POST_TIMEZONE)
-            start_dt = datetime(date_parsed.year, date_parsed.month, date_parsed.day, start_time.hour, start_time.minute, tzinfo=tz)
-            end_dt = datetime(date_parsed.year, date_parsed.month, date_parsed.day, end_time.hour, end_time.minute, tzinfo=tz)
+            start_dt = datetime(start_date.year, start_date.month, start_date.day, start_time.hour, start_time.minute, tzinfo=tz)
+            end_dt = datetime(end_date.year, end_date.month, end_date.day, end_time.hour, end_time.minute, tzinfo=tz)
 
             event_id = datetime.now(tz=ZoneInfo(POST_TIMEZONE)).strftime("%Y%m%dT%H%M%S") + "-" + str(interaction.user.id)
             created_at = datetime.now(timezone.utc).isoformat()
             try:
                 db_execute("INSERT INTO created_events(id, poll_id, title, description, start_time, end_time, participants, location, posted_channel_id, posted_message_id, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                           (event_id, self.poll_id, title, "", start_dt.isoformat(), end_dt.isoformat(), "", location, None, None, created_at))
+                           (event_id, self.poll_id, title, description, start_dt.isoformat(), end_dt.isoformat(), "", location, None, None, created_at))
             except Exception:
                 log.exception("Failed inserting created_event")
                 try:
@@ -645,7 +667,7 @@ class CreateEventModal(discord.ui.Modal, title="Event erstellen"):
                     pass
                 return
 
-            embed = discord.Embed(title=f"📣 {title}", description="", color=discord.Color.orange(), timestamp=datetime.now(timezone.utc))
+            embed = discord.Embed(title=f"📣 {title}", description=description or "", color=discord.Color.orange(), timestamp=datetime.now(timezone.utc))
             if start_dt:
                 try:
                     embed.add_field(name="Startdatum", value=start_dt.strftime("%d.%m.%Y"), inline=True)
@@ -689,7 +711,7 @@ class CreateEventModal(discord.ui.Modal, title="Event erstellen"):
             except Exception:
                 pass
 
-# Simplified event creation buttons (removed Match/New buttons, directly open single modal)
+# Simplified event creation buttons
 class CreateEventButton(discord.ui.Button):
     def __init__(self, poll_id: str):
         super().__init__(label="📅 Event erstellen", style=discord.ButtonStyle.success, custom_id=f"createevent:{poll_id}")
