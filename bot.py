@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 bot.py — Event creation: Single modal with flexible parsing, creates Bot Event only (no Discord Scheduled Event).
-Embed layout adjusted: normal spacing, matches back in poll embed.
+Embed layout adjusted: no confirmation on idea delete, no icons in event embed, added quarterly poll with day-based availability.
 
 Replace your running bot.py with this file and restart the bot.
 """
@@ -37,6 +37,7 @@ DB_PATH = os.getenv("POLL_DB", "polls.sqlite")
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 CHANNEL_ID = int(os.getenv("CHANNEL_ID", "0")) if os.getenv("CHANNEL_ID") else None
 CREATED_EVENTS_CHANNEL_ID = int(os.getenv("CREATED_EVENTS_CHANNEL_ID", "0")) if os.getenv("CREATED_EVENTS_CHANNEL_ID") else None
+QUARTERLY_CHANNEL_ID = int(os.getenv("QUARTERLY_CHANNEL_ID", "0")) if os.getenv("QUARTERLY_CHANNEL_ID") else None  # New variable
 POST_TIMEZONE = os.getenv("POST_TIMEZONE", "Europe/Berlin")
 
 # -------------------------
@@ -133,6 +134,7 @@ def db_execute(query: str, params=(), fetch=False, many=False):
 # Utilities
 # -------------------------
 DAYS = ["Mo", "Di", "Mi", "Do", "Fr", "Sa", "So"]
+MONTHS = ["Jan", "Feb", "Mär", "Apr", "Mai", "Jun", "Jul", "Aug", "Sep", "Okt", "Nov", "Dez"]
 HOURS = list(range(12, 24))
 
 def slot_label_range(day_short: str, hour: int) -> str:
@@ -239,6 +241,52 @@ def parse_time_range(time_range_str: str) -> Tuple[Optional[_time], Optional[_ti
     start_time = parse_time_hhmm(start_str)
     end_time = parse_time_hhmm(end_str)
     return start_time, end_time
+
+# New utilities for quarterly
+def get_current_quarter_start() -> date:
+    now = datetime.now(ZoneInfo(POST_TIMEZONE)).date()
+    year = now.year
+    if now.month <= 3:
+        start_month = 1
+    elif now.month <= 6:
+        start_month = 4
+    elif now.month <= 9:
+        start_month = 7
+    else:
+        start_month = 10
+    return date(year, start_month, 1)
+
+def get_quarter_months(start_date: date) -> List[str]:
+    months = []
+    for i in range(3):
+        m = (start_date.month + i - 1) % 12 + 1
+        y = start_date.year + ((start_date.month + i - 1) // 12)
+        months.append(f"{MONTHS[m-1]}. {y}")
+    return months
+
+def get_month_weeks(month_str: str) -> List[Tuple[str, date, date]]:
+    # month_str like "Jan. 2026"
+    month_name, year_s = month_str.split(". ")
+    year = int(year_s)
+    month = MONTHS.index(month_name) + 1
+    first_day = date(year, month, 1)
+    weeks = []
+    current = first_day
+    while current.month == month:
+        week_start = current
+        week_end = min(week_start + timedelta(days=6), date(year, month + 1, 1) - timedelta(days=1) if month < 12 else date(year+1, 1, 1) - timedelta(days=1))
+        label = f"{week_start.strftime('%d.%m.')}-{week_end.strftime('%d.%m.')}"
+        weeks.append((label, week_start, week_end))
+        current = week_end + timedelta(days=1)
+    return weeks
+
+def get_week_days(week_start: date, week_end: date) -> List[str]:
+    days = []
+    current = week_start
+    while current <= week_end:
+        days.append(f"{DAYS[current.weekday()]} {current.strftime('%d.%m.')}")
+        current += timedelta(days=1)
+    return days
 
 # -------------------------
 # Poll persistence helpers
@@ -386,6 +434,52 @@ def generate_poll_embed_from_db(poll_id: str, guild: Optional[discord.Guild] = N
         embed.add_field(name=opt_text or "(ohne Titel)", value=value, inline=False)
     return embed
 
+def generate_quarterly_poll_embed_from_db(poll_id: str, guild: Optional[discord.Guild] = None):
+    # Similar to weekly, but adjusted for quarterly
+    options = get_options(poll_id)
+    votes = get_votes_for_poll(poll_id)
+    votes_map = {}
+    for opt_id, uid in votes:
+        votes_map.setdefault(opt_id, []).append(uid)
+    quarter_start = get_current_quarter_start()
+    embed = discord.Embed(
+        title=f"📋 Quartalsumfrage Q{(quarter_start.month-1)//3 + 1} {quarter_start.year}",
+        description="Gib eigene Ideen ein, stimme ab oder trage deine verfügbaren Tage ein!"
+    )
+    for opt_id, opt_text, _created, author_id in options:
+        voters = votes_map.get(opt_id, [])
+        count = len(voters)
+        header = f"🗳️ {count} Stimme" if count == 1 else f"🗳️ {count} Stimmen"
+        if voters:
+            names = [user_display_name(guild, uid) for uid in voters]
+            if len(names) > 10:
+                shown = names[:10]
+                remaining = len(names) - 10
+                names_line = ", ".join(shown) + f", und {remaining} weitere..."
+            else:
+                names_line = ", ".join(names)
+            value = header + "\n👥 " + names_line
+        else:
+            value = header + "\n👥 Keine Stimmen"
+        # For quarterly, matches based on days
+        if len(voters) >= 2:
+            avail_rows = get_availability_for_poll(poll_id)
+            slot_map = {}
+            for uid, slot in avail_rows:
+                if uid in voters:
+                    slot_map.setdefault(slot, []).append(uid)
+            common = [(s, ulist) for s, ulist in slot_map.items() if len(ulist) >= 2]
+            if common:
+                max_count = max(len(ulist) for (_, ulist) in common)
+                best = [(s, ulist) for (s, ulist) in common if len(ulist) == max_count]
+                lines = []
+                for s, ulist in best:
+                    names = [user_display_name(guild, u) for u in ulist]
+                    lines.append(f"{s}: {', '.join(names)}")
+                value += "\n✅ Gemeinsame Tage (beliebteste):\n" + "\n".join(lines)
+        embed.add_field(name=opt_text or "(ohne Titel)", value=value, inline=False)
+    return embed
+
 # -------------------------
 # In-memory temporary storages
 # -------------------------
@@ -417,13 +511,13 @@ class SuggestModal(discord.ui.Modal, title="Neue Idee hinzufügen"):
                 async for msg in interaction.channel.history(limit=200):
                     if msg.author == bot.user and msg.embeds:
                         em = msg.embeds[0]
-                        if em.title and "Worauf" in em.title:
-                            embed = generate_poll_embed_from_db(self.poll_id, interaction.guild)
+                        if "Worauf" in em.title or "Quartalsumfrage" in em.title:
+                            embed = generate_poll_embed_from_db(self.poll_id, interaction.guild) if "Worauf" in em.title else generate_quarterly_poll_embed_from_db(self.poll_id, interaction.guild)
                             try:
-                                bot.add_view(PollView(self.poll_id))
+                                bot.add_view(PollView(self.poll_id) if "Worauf" in em.title else QuarterlyPollView(self.poll_id))
                             except Exception:
                                 pass
-                            await msg.edit(embed=embed, view=PollView(self.poll_id))
+                            await msg.edit(embed=embed, view=PollView(self.poll_id) if "Worauf" in em.title else QuarterlyPollView(self.poll_id))
                             break
         except Exception:
             log.exception("Best-effort update failed")
@@ -562,6 +656,111 @@ class AvailabilityDayView(discord.ui.View):
         self.add_item(submit)
         self.add_item(remove)
 
+# Quarterly availability
+class MonthSelectButton(discord.ui.Button):
+    def __init__(self, poll_id: str, month_index: int, months: list):
+        label = months[month_index]
+        custom_id = f"month:{poll_id}:{month_index}"
+        super().__init__(label=label, style=discord.ButtonStyle.secondary, custom_id=custom_id)
+        self.poll_id = poll_id
+        self.month_index = month_index
+        self.months = months
+    async def callback(self, interaction: discord.Interaction):
+        month_str = self.months[self.month_index]
+        weeks = get_month_weeks(month_str)
+        view = WeekSelectView(self.poll_id, weeks)
+        embed = discord.Embed(
+            title=f"🗓️ Wochen in {month_str}",
+            description="Wähle eine Woche aus.",
+            color=discord.Color.blue()
+        )
+        try:
+            await interaction.response.edit_message(embed=embed, view=view)
+        except Exception:
+            pass
+
+class WeekSelectView(discord.ui.View):
+    def __init__(self, poll_id: str, weeks: list):
+        super().__init__(timeout=None)
+        self.poll_id = poll_id
+        for i, (label, start, end) in enumerate(weeks):
+            btn = WeekButton(poll_id, label, start, end)
+            self.add_item(btn)
+
+class WeekButton(discord.ui.Button):
+    def __init__(self, poll_id: str, label: str, start: date, end: date):
+        super().__init__(label=label, style=discord.ButtonStyle.secondary)
+        self.poll_id = poll_id
+        self.start = start
+        self.end = end
+    async def callback(self, interaction: discord.Interaction):
+        days = get_week_days(self.start, self.end)
+        view = DaySelectView(self.poll_id, days)
+        embed = discord.Embed(
+            title=f"📅 Tage in {self.label}",
+            description="Wähle verfügbare Tage aus.",
+            color=discord.Color.green()
+        )
+        try:
+            await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
+        except Exception:
+            pass
+
+class DaySelectView(discord.ui.View):
+    def __init__(self, poll_id: str, days: list):
+        super().__init__(timeout=None)
+        self.poll_id = poll_id
+        for day in days:
+            btn = DayAvailButton(poll_id, day)
+            self.add_item(btn)
+        submit = QuarterlySubmitButton(poll_id)
+        self.add_item(submit)
+
+class DayAvailButton(discord.ui.Button):
+    def __init__(self, poll_id: str, day: str):
+        super().__init__(label=day, style=discord.ButtonStyle.secondary)
+        self.poll_id = poll_id
+        self.day = day
+    async def callback(self, interaction: discord.Interaction):
+        uid = interaction.user.id
+        _tmp = temp_selections.setdefault(self.poll_id, {})
+        user_tmp = _tmp.setdefault(uid, set())
+        if self.day in user_tmp:
+            user_tmp.remove(self.day)
+            self.style = discord.ButtonStyle.secondary
+        else:
+            user_tmp.add(self.day)
+            self.style = discord.ButtonStyle.success
+        try:
+            await interaction.response.edit_message(view=self.view)
+        except Exception:
+            pass
+
+class QuarterlySubmitButton(discord.ui.Button):
+    def __init__(self, poll_id: str):
+        super().__init__(label="✅ Absenden", style=discord.ButtonStyle.success)
+        self.poll_id = poll_id
+    async def callback(self, interaction: discord.Interaction):
+        uid = interaction.user.id
+        user_tmp = temp_selections.get(self.poll_id, {}).get(uid, set())
+        persist_availability(self.poll_id, uid, list(user_tmp))
+        if self.poll_id in temp_selections and uid in temp_selections[self.poll_id]:
+            temp_selections[self.poll_id].pop(uid, None)
+        try:
+            await interaction.response.send_message("✅ Tage gespeichert!", ephemeral=True)
+        except Exception:
+            pass
+
+class QuarterlyAvailabilityView(discord.ui.View):
+    def __init__(self, poll_id: str):
+        super().__init__(timeout=None)
+        self.poll_id = poll_id
+        quarter_start = get_current_quarter_start()
+        months = get_quarter_months(quarter_start)
+        for i in range(3):
+            btn = MonthSelectButton(poll_id, i, months)
+            self.add_item(btn)
+
 # Edit-own-ideas UI
 class DeleteOwnOptionButtonEphemeral(discord.ui.Button):
     def __init__(self, poll_id: str, option_id: int, option_text: str, user_id: int):
@@ -579,33 +778,22 @@ class DeleteOwnOptionButtonEphemeral(discord.ui.Button):
             return
         db_execute("DELETE FROM options WHERE id = ?", (self.option_id,))
         db_execute("DELETE FROM votes WHERE option_id = ?", (self.option_id,))
-        try:
-            await interaction.response.send_message(f"✅ Idee gelöscht: {self.option_text}", ephemeral=True)
-        except Exception:
-            pass
+        # Removed confirmation message
         try:
             if interaction.channel:
                 async for msg in interaction.channel.history(limit=200):
                     if msg.author == bot.user and msg.embeds:
                         em = msg.embeds[0]
-                        if em.title and "Worauf" in em.title:
-                            rows = db_execute("SELECT id FROM polls ORDER BY created_at DESC LIMIT 1", fetch=True)
-                            if rows:
-                                poll_id = rows[0][0]
-                                new_embed = generate_poll_embed_from_db(poll_id, interaction.guild)
-                                try:
-                                    bot.add_view(PollView(poll_id))
-                                except Exception:
-                                    pass
-                                await msg.edit(embed=new_embed, view=PollView(poll_id))
+                        if "Worauf" in em.title or "Quartalsumfrage" in em.title:
+                            embed = generate_poll_embed_from_db(self.poll_id, interaction.guild) if "Worauf" in em.title else generate_quarterly_poll_embed_from_db(self.poll_id, interaction.guild)
+                            try:
+                                bot.add_view(PollView(self.poll_id) if "Worauf" in em.title else QuarterlyPollView(self.poll_id))
+                            except Exception:
+                                pass
+                            await msg.edit(embed=embed, view=PollView(self.poll_id) if "Worauf" in em.title else QuarterlyPollView(self.poll_id))
                             break
         except Exception:
             log.exception("Failed best-effort poll update on delete")
-        try:
-            refreshed = EditOwnIdeasView(self.poll_id, self.user_id)
-            await interaction.followup.send("🔄 Aktualisierte Liste deiner Ideen:", view=refreshed, ephemeral=True)
-        except Exception:
-            pass
 
 class EditOwnIdeasView(discord.ui.View):
     def __init__(self, poll_id: str, user_id: int):
@@ -792,7 +980,7 @@ class CreateEventModal(discord.ui.Modal, title="Event erstellen"):
                 color=discord.Color.blue()
                 # No timestamp
             )
-            embed.set_thumbnail(url=interaction.guild.icon.url if interaction.guild and interaction.guild.icon else None)  # Server logo (size not controllable in embeds)
+            embed.set_thumbnail(url=interaction.guild.icon.url if interaction.guild and interaction.guild.icon else None)  # Server logo
 
             # Normal spacing (removed extra spacer)
 
@@ -807,10 +995,10 @@ class CreateEventModal(discord.ui.Modal, title="Event erstellen"):
                 wann_value = f"{date_part} {time_part_start} – {time_part_end} Uhr"
             else:
                 wann_value = f"{start_str} – {end_str}"
-            embed.add_field(name="🕒 Wann", value=wann_value, inline=False)
+            embed.add_field(name="Wann", value=wann_value, inline=False)  # Removed clock icon
 
             # Location
-            embed.add_field(name="📍 Ort", value=location or "Nicht angegeben", inline=False)
+            embed.add_field(name="Ort", value=location or "Nicht angegeben", inline=False)  # Removed location icon
 
             # RSVP Info
             rows2 = db_execute("SELECT user_id FROM created_event_rsvps WHERE event_id = ?", (event_id,), fetch=True) or []
@@ -873,6 +1061,73 @@ class CreateEventButton(discord.ui.Button):
             except Exception:
                 log.exception("Failed to send CreateEventModal")
 
+# Quarterly poll view
+class QuarterlyPollView(discord.ui.View):
+    def __init__(self, poll_id: str):
+        super().__init__(timeout=None)
+        self.poll_id = poll_id
+        options = get_options(poll_id)
+        for opt_id, opt_text, _created, author_id in options:
+            try:
+                self.add_item(QuarterlyPollButton(poll_id, opt_id, opt_text))
+            except Exception:
+                pass
+        try:
+            self.add_item(AddOptionButton(poll_id))
+        except Exception:
+            pass
+        try:
+            self.add_item(QuarterlyAddAvailabilityButton(poll_id))
+        except Exception:
+            pass
+        try:
+            self.add_item(CreateEventButton(poll_id))
+        except Exception:
+            pass
+        try:
+            self.add_item(OpenEditOwnIdeasButton(poll_id))
+        except Exception:
+            pass
+
+class QuarterlyPollButton(discord.ui.Button):
+    def __init__(self, poll_id: str, option_id: int, option_text: str):
+        super().__init__(label=option_text, style=discord.ButtonStyle.primary, custom_id=f"qpoll:{poll_id}:{option_id}")
+        self.poll_id = poll_id
+        self.option_id = option_id
+    async def callback(self, interaction: discord.Interaction):
+        uid = interaction.user.id
+        rows = db_execute("SELECT 1 FROM votes WHERE poll_id = ? AND option_id = ? AND user_id = ?", (self.poll_id, self.option_id, uid), fetch=True)
+        if rows:
+            remove_vote(self.poll_id, self.option_id, uid)
+        else:
+            add_vote(self.poll_id, self.option_id, uid)
+        embed = generate_quarterly_poll_embed_from_db(self.poll_id, interaction.guild)
+        try:
+            new_view = QuarterlyPollView(self.poll_id)
+            bot.add_view(new_view)
+            await interaction.response.edit_message(embed=embed, view=new_view)
+        except Exception:
+            try:
+                await interaction.response.edit_message(embed=embed)
+            except Exception:
+                pass
+
+class QuarterlyAddAvailabilityButton(discord.ui.Button):
+    def __init__(self, poll_id: str):
+        super().__init__(label="🗓️ Verfügbarkeit hinzufügen", style=discord.ButtonStyle.success, custom_id=f"qavail:{poll_id}")
+        self.poll_id = poll_id
+    async def callback(self, interaction: discord.Interaction):
+        try:
+            view = QuarterlyAvailabilityView(self.poll_id)
+            embed = discord.Embed(
+                title="🗓️ Quartals-Verfügbarkeit auswählen",
+                description="Wähle Monate des Quartals aus.",
+                color=discord.Color.green()
+            )
+            await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
+        except Exception:
+            log.exception("Failed opening QuarterlyAvailabilityView")
+
 # -------------------------
 # Removed: All step1/step2, Match/New buttons, create_step2_modal_instance, EditParticipantsModal, EditDescriptionLocationModal, FinalizeEventView etc.
 # -------------------------
@@ -902,11 +1157,11 @@ async def build_created_event_embed(event_id: str, guild: Optional[discord.Guild
                 start_str = start_dt.strftime("%d.%m.%y %H:%M")
                 end_str = end_dt.strftime("%d.%m.%y %H:%M") if end_dt else ""
                 wann_value = f"{start_str} – {end_str}" if end_str else start_str
-            embed.add_field(name="🕒 Wann", value=wann_value, inline=False)
+            embed.add_field(name="Wann", value=wann_value, inline=False)  # Removed clock icon
         except Exception:
-            embed.add_field(name="🕒 Wann", value=start_iso, inline=False)
+            embed.add_field(name="Wann", value=start_iso, inline=False)
     if location:
-        embed.add_field(name="📍 Ort", value=location, inline=False)
+        embed.add_field(name="Ort", value=location, inline=False)  # Removed location icon
     rows2 = db_execute("SELECT user_id FROM created_event_rsvps WHERE event_id = ?", (event_id,), fetch=True) or []
     user_ids = [r[0] for r in rows2]
     if user_ids:
@@ -949,79 +1204,6 @@ class EventSignupView(discord.ui.View):
             await interaction.message.edit(embed=embed, view=new_view)
         except Exception:
             log.exception("Failed to update event message after RSVP")
-
-# Poll button & PollView
-class PollButton(discord.ui.Button):
-    def __init__(self, poll_id: str, option_id: int, option_text: str):
-        super().__init__(label=option_text, style=discord.ButtonStyle.primary, custom_id=f"poll:{poll_id}:{option_id}")
-        self.poll_id = poll_id
-        self.option_id = option_id
-    async def callback(self, interaction: discord.Interaction):
-        uid = interaction.user.id
-        rows = db_execute("SELECT 1 FROM votes WHERE poll_id = ? AND option_id = ? AND user_id = ?", (self.poll_id, self.option_id, uid), fetch=True)
-        if rows:
-            remove_vote(self.poll_id, self.option_id, uid)
-        else:
-            add_vote(self.poll_id, self.option_id, uid)
-        embed = generate_poll_embed_from_db(self.poll_id, interaction.guild)
-        try:
-            new_view = PollView(self.poll_id)
-            bot.add_view(new_view)
-            await interaction.response.edit_message(embed=embed, view=new_view)
-        except Exception:
-            try:
-                await interaction.response.edit_message(embed=embed)
-            except Exception:
-                pass
-
-class PollView(discord.ui.View):
-    def __init__(self, poll_id: str):
-        super().__init__(timeout=None)
-        self.poll_id = poll_id
-        options = get_options(poll_id)
-        for opt_id, opt_text, _created, author_id in options:
-            try:
-                self.add_item(PollButton(poll_id, opt_id, opt_text))
-            except Exception:
-                pass
-        try:
-            self.add_item(AddOptionButton(poll_id))
-        except Exception:
-            pass
-        try:
-            self.add_item(AddAvailabilityButton(poll_id))
-        except Exception:
-            pass
-        try:
-            self.add_item(CreateEventButton(poll_id))
-        except Exception:
-            pass
-        try:
-            self.add_item(OpenEditOwnIdeasButton(poll_id))
-        except Exception:
-            pass
-
-# AddAvailabilityButton
-class AddAvailabilityButton(discord.ui.Button):
-    def __init__(self, poll_id: str):
-        super().__init__(label="🕓 Verfügbarkeit hinzufügen", style=discord.ButtonStyle.success, custom_id=f"avail:{poll_id}")
-        self.poll_id = poll_id
-    async def callback(self, interaction: discord.Interaction):
-        try:
-            view = AvailabilityDayView(self.poll_id, day_index=0, for_user=interaction.user.id)
-            embed = discord.Embed(
-                title="🕓 Verfügbarkeit auswählen",
-                description="Wähle Stunden für den angezeigten Tag (Mo.–So.).",
-                color=discord.Color.green(),
-                timestamp=datetime.now(timezone.utc)
-            )
-            await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
-        except Exception:
-            log.exception("Failed opening AvailabilityDayView")
-            try:
-                await interaction.response.send_message("Fehler beim Öffnen der Verfügbarkeits-Auswahl.", ephemeral=True)
-            except Exception:
-                pass
 
 # -------------------------
 # Reminders, posting, scheduling, commands (unchanged flow)
@@ -1136,6 +1318,18 @@ async def post_poll_to_channel(channel: discord.abc.Messageable):
     await channel.send(embed=embed, view=view)
     return poll_id
 
+async def post_quarterly_poll_to_channel(channel: discord.abc.Messageable):
+    poll_id = datetime.now(tz=ZoneInfo(POST_TIMEZONE)).strftime("%Y%m%dT%H%M%S") + "_quarterly"
+    create_poll_record(poll_id)
+    embed = generate_quarterly_poll_embed_from_db(poll_id, channel.guild if isinstance(channel, discord.TextChannel) else None)
+    view = QuarterlyPollView(poll_id)
+    try:
+        bot.add_view(view)
+    except Exception:
+        pass
+    await channel.send(embed=embed, view=view)
+    return poll_id
+
 @bot.command()
 async def startpoll(ctx):
     try:
@@ -1191,7 +1385,7 @@ async def post_daily_summary():
     await post_daily_summary_to(channel)
 
 async def post_daily_summary_to(channel: discord.TextChannel):
-    rows = db_execute("SELECT id, created_at FROM polls ORDER BY created_at DESC LIMIT 1", fetch=True)
+    rows = db_execute("SELECT id, created_at FROM polls WHERE id NOT LIKE '%_quarterly' ORDER BY created_at DESC LIMIT 1", fetch=True)
     if not rows:
         return
     poll_id, poll_created = rows[0]
@@ -1303,9 +1497,34 @@ async def job_post_weekly_coro():
     except Exception:
         log.exception("Failed posting weekly poll job")
 
+def job_post_quarterly():
+    asyncio.create_task(job_post_quarterly_coro())
+
+async def job_post_quarterly_coro():
+    await bot.wait_until_ready()
+    channel = None
+    if QUARTERLY_CHANNEL_ID:
+        channel = bot.get_channel(QUARTERLY_CHANNEL_ID)
+    if not channel:
+        log.info("Kein Quartals-Kanal gefunden.")
+        return
+    try:
+        poll_id = await post_quarterly_poll_to_channel(channel)
+        log.info(f"Posted quarterly poll {poll_id} to {channel} at {datetime.now(tz=ZoneInfo(POST_TIMEZONE))}")
+    except Exception:
+        log.exception("Failed posting quarterly poll job")
+
 def schedule_weekly_post():
     trigger = CronTrigger(day_of_week="sun", hour=12, minute=0, timezone=ZoneInfo(POST_TIMEZONE))
     scheduler.add_job(job_post_weekly, trigger=trigger, id="weekly_poll", replace_existing=True)
+
+def schedule_quarterly_post():
+    # Am 1. des Vormonats, z.B. 01.11.2025 für Q1 2026
+    now = datetime.now(ZoneInfo(POST_TIMEZONE))
+    prev_month = (now.month - 2) % 12 + 1
+    year = now.year if now.month > 1 else now.year - 1
+    trigger = CronTrigger(day=1, month=prev_month, year=year, hour=12, minute=0, timezone=ZoneInfo(POST_TIMEZONE))
+    scheduler.add_job(job_post_quarterly, trigger=trigger, id="quarterly_poll", replace_existing=True)
 
 def schedule_daily_summary():
     trigger_morning = CronTrigger(day_of_week="*", hour=9, minute=0, timezone=ZoneInfo(POST_TIMEZONE))
@@ -1320,7 +1539,10 @@ async def register_persistent_poll_views_async(batch_delay: float = 0.02):
     await asyncio.sleep(0.5)
     for (poll_id,) in rows:
         try:
-            view = PollView(poll_id)
+            if "_quarterly" in poll_id:
+                view = QuarterlyPollView(poll_id)
+            else:
+                view = PollView(poll_id)
             bot.add_view(view)
         except Exception:
             log.exception("Failed to add persistent view for poll %s", poll_id)
@@ -1333,6 +1555,7 @@ async def on_ready():
     if not scheduler.running:
         scheduler.start()
     schedule_weekly_post()
+    schedule_quarterly_post()
     schedule_daily_summary()
     try:
         bot.loop.create_task(register_persistent_poll_views_async(batch_delay=0.02))
