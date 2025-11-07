@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
-bot.py — Event creation: Step1 -> directly opens Step2 modal (no extra click).
-Fixed: create_step2_modal_instance now always returns TextInput-based modal to avoid Invalid Form Body errors.
-Keeps previous behaviors: silent availability save, Startdatum/Enddatum fields etc.
+bot.py — Event creation reduced to single modal with fields: Titel, Datum, Beginn, Ende, Ort.
+Uses TextInputs only (no native pickers in modals); user enters date/time manually (DD.MM.YYYY, HH:MM), location as text (e.g., #channelname).
+Directly creates event on submit without steps.
 
 Replace your running bot.py with this file and restart the bot.
 """
@@ -569,418 +569,174 @@ class OpenEditOwnIdeasButton(discord.ui.Button):
         except Exception:
             pass
 
-# Event creation: Match/New buttons and direct Step1->Step2 flow
-class MatchButton(discord.ui.Button):
-    def __init__(self, poll_id: str, matches_key: str, index: int):
-        super().__init__(label=f"Wähle {index+1}", style=discord.ButtonStyle.primary)
-        self.poll_id = poll_id
-        self.matches_key = matches_key
-        self.index = index
-    async def callback(self, interaction: discord.Interaction):
-        data = create_event_temp_storage.get(self.matches_key, {})
-        entries = data.get("entries", [])
-        if not entries or self.index < 0 or self.index >= len(entries):
-            try:
-                await interaction.response.send_message("Ungültige Auswahl.", ephemeral=True)
-            except Exception:
-                pass
-            return
-        entry = entries[self.index]
-        opt_text = entry.get("opt_text", "")
-        slot = entry.get("slot")
-        uids = entry.get("users", [])
-        try:
-            day, hour_s = slot.split("-")
-            hour = int(hour_s)
-        except Exception:
-            day, hour = "Mo", 18
-        dt_date = next_date_for_day_short(day, tz=ZoneInfo(POST_TIMEZONE))
-        tmp_key = f"create_event:{interaction.user.id}"
-        create_event_temp_storage[tmp_key] = {
-            "poll_id": self.poll_id,
-            "opt_text": opt_text,
-            "slot": slot,
-            "uids": uids,
-            "default_start_date": date_to_ddmmyyyy(dt_date),
-            "default_end_date": date_to_ddmmyyyy(dt_date),
-            "default_start": f"{hour:02d}:00",
-            "default_end": f"{(hour+1)%24:02d}:00",
-            "mentions": " ".join(f"<@{u}>" for u in uids),
-            "default_location": "",
-            "description": "",
-            "location": "",
-        }
-        modal = CreateEventStep1Modal(tmp_key)
-        try:
-            await interaction.response.send_modal(modal)
-        except Exception:
-            log.exception("Failed to send CreateEvent Step1 modal from MatchButton")
-            try:
-                await interaction.response.send_message("Fehler beim Öffnen des Event-Modals.", ephemeral=True)
-            except Exception:
-                pass
-        try:
-            create_event_temp_storage.pop(self.matches_key, None)
-        except Exception:
-            pass
+# Event creation: Single modal with Titel, Datum, Beginn, Ende, Ort (all TextInputs)
+class CreateEventModal(discord.ui.Modal, title="Event erstellen"):
+    title_field = discord.ui.TextInput(label="Titel", style=discord.TextStyle.short, max_length=100)
+    date_field = discord.ui.TextInput(label="Datum", style=discord.TextStyle.short, placeholder="01.01.2026", max_length=20)
+    start_field = discord.ui.TextInput(label="Beginn", style=discord.TextStyle.short, placeholder="18:00", max_length=8)
+    end_field = discord.ui.TextInput(label="Ende", style=discord.TextStyle.short, placeholder="20:00", max_length=8)
+    location_field = discord.ui.TextInput(label="Ort", style=discord.TextStyle.short, placeholder="#channelname oder Text", max_length=200)
 
-class NewEventButton(discord.ui.Button):
-    def __init__(self, poll_id: str, matches_key: str):
-        super().__init__(label="Neues Event", style=discord.ButtonStyle.secondary)
+    def __init__(self, poll_id: str):
+        super().__init__(title="Event erstellen")
         self.poll_id = poll_id
-        self.matches_key = matches_key
-    async def callback(self, interaction: discord.Interaction):
-        tmp_key = f"create_event:{interaction.user.id}"
-        create_event_temp_storage[tmp_key] = {
-            "poll_id": self.poll_id,
-            "opt_text": "",
-            "slot": None,
-            "uids": [],
-            "default_start_date": date_to_ddmmyyyy(date.today()),
-            "default_end_date": date_to_ddmmyyyy(date.today()),
-            "default_start": "18:00",
-            "default_end": "19:00",
-            "mentions": "",
-            "default_location": "",
-            "description": "",
-            "location": "",
-        }
-        modal = CreateEventStep1Modal(tmp_key)
+
+    async def on_submit(self, interaction: discord.Interaction):
         try:
-            await interaction.response.send_modal(modal)
-        except Exception:
-            log.exception("Failed to send CreateEvent Step1 modal from NewEventButton")
+            title = str(self.title_field.value).strip()
+            date_str = str(self.date_field.value).strip()
+            start_time_str = str(self.start_field.value).strip()
+            end_time_str = str(self.end_field.value).strip()
+            location = str(self.location_field.value).strip()
+
+            if not title or not date_str or not start_time_str or not end_time_str:
+                try:
+                    await interaction.response.send_message("Alle Felder außer Ort sind erforderlich.", ephemeral=True)
+                except Exception:
+                    log.exception("Failed to send required fields message")
+                return
+
+            date_parsed = parse_date_ddmmyyyy(date_str)
+            start_time = parse_time_hhmm(start_time_str)
+            end_time = parse_time_hhmm(end_time_str)
+
+            if not date_parsed or not start_time or not end_time:
+                try:
+                    await interaction.response.send_message("Datum/Uhrzeit konnte nicht geparst. Bitte benutze DD.MM.YYYY und HH:MM.", ephemeral=True)
+                except Exception:
+                    log.exception("Failed to send invalid-date ephemeral")
+                return
+
+            tz = ZoneInfo(POST_TIMEZONE)
+            start_dt = datetime(date_parsed.year, date_parsed.month, date_parsed.day, start_time.hour, start_time.minute, tzinfo=tz)
+            end_dt = datetime(date_parsed.year, date_parsed.month, date_parsed.day, end_time.hour, end_time.minute, tzinfo=tz)
+
+            event_id = datetime.now(tz=ZoneInfo(POST_TIMEZONE)).strftime("%Y%m%dT%H%M%S") + "-" + str(interaction.user.id)
+            created_at = datetime.now(timezone.utc).isoformat()
             try:
-                await interaction.response.send_message("Fehler beim Öffnen des Event-Modals.", ephemeral=True)
+                db_execute("INSERT INTO created_events(id, poll_id, title, description, start_time, end_time, participants, location, posted_channel_id, posted_message_id, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                           (event_id, self.poll_id, title, "", start_dt.isoformat(), end_dt.isoformat(), "", location, None, None, created_at))
+            except Exception:
+                log.exception("Failed inserting created_event")
+                try:
+                    await interaction.response.send_message("Fehler beim Speichern des Events.", ephemeral=True)
+                except Exception:
+                    pass
+                return
+
+            # automatically add creator as interested
+            try:
+                creator_uid = interaction.user.id
+                db_execute("INSERT OR IGNORE INTO created_event_rsvps(event_id, user_id) VALUES (?, ?)", (event_id, creator_uid))
+            except Exception:
+                log.exception("Failed adding creator to RSVPs")
+
+            target_channel = None
+            if CREATED_EVENTS_CHANNEL_ID:
+                target_channel = bot.get_channel(CREATED_EVENTS_CHANNEL_ID)
+            if not target_channel and CHANNEL_ID:
+                target_channel = bot.get_channel(CHANNEL_ID)
+            if not target_channel and isinstance(interaction.channel, discord.TextChannel):
+                target_channel = interaction.channel
+            if not target_channel:
+                try:
+                    await interaction.response.send_message("Kein Zielkanal gefunden, um das Event zu posten.", ephemeral=True)
+                except Exception:
+                    pass
+                return
+
+            embed = discord.Embed(title=f"📣 {title}", description="", color=discord.Color.orange(), timestamp=datetime.now(timezone.utc))
+            if start_dt:
+                try:
+                    embed.add_field(name="Startdatum", value=start_dt.strftime("%d.%m.%Y"), inline=True)
+                    embed.add_field(name="Beginn", value=start_dt.strftime("%H:%M"), inline=True)
+                except Exception:
+                    embed.add_field(name="Start", value=str(start_dt), inline=False)
+            if end_dt:
+                try:
+                    embed.add_field(name="Enddatum", value=end_dt.strftime("%d.%m.%Y"), inline=True)
+                    embed.add_field(name="Ende", value=end_dt.strftime("%H:%M"), inline=True)
+                except Exception:
+                    embed.add_field(name="Ende", value=str(end_dt), inline=False)
+            if location:
+                embed.add_field(name="Ort", value=location, inline=False)
+
+            view = EventSignupView(event_id)
+            try:
+                bot.add_view(view)
             except Exception:
                 pass
-        try:
-            create_event_temp_storage.pop(self.matches_key, None)
+            try:
+                sent = await target_channel.send(embed=embed, view=view)
+                db_execute("UPDATE created_events SET posted_channel_id = ?, posted_message_id = ? WHERE id = ?", (target_channel.id, sent.id, event_id))
+            except Exception:
+                log.exception("Failed posting created event to channel")
+                try:
+                    await interaction.response.send_message("Fehler beim Posten des Events.", ephemeral=True)
+                except Exception:
+                    pass
+                return
+            if start_dt:
+                schedule_reminders_for_created_event(event_id, start_dt, target_channel.id)
+            try:
+                await interaction.response.send_message("✅ Event erstellt und gepostet.", ephemeral=True)
+            except Exception:
+                pass
         except Exception:
-            pass
+            log.exception("Unhandled error in CreateEventModal.on_submit")
+            try:
+                await interaction.response.send_message("Interner Fehler beim Verarbeiten des Formulars.", ephemeral=True)
+            except Exception:
+                pass
 
+# Simplified event creation buttons (removed Match/New buttons, directly open single modal)
 class CreateEventButton(discord.ui.Button):
     def __init__(self, poll_id: str):
         super().__init__(label="📅 Event erstellen", style=discord.ButtonStyle.success, custom_id=f"createevent:{poll_id}")
         self.poll_id = poll_id
     async def callback(self, interaction: discord.Interaction):
-        matches = compute_matches_for_poll_from_db(self.poll_id)
-        embed = discord.Embed(title="Matches auswählen — oder Neues Event", color=discord.Color.blue(), timestamp=datetime.now(timezone.utc))
-        match_entries: List[Dict] = []
-        idx = 0
-        for opt_text, infos in matches.items():
-            for info in infos:
-                slot = info.get("slot")
-                users = info.get("users", [])
-                names = [user_display_name(interaction.guild if interaction.guild else None, u) for u in users]
-                names_line = ", ".join(names) if names else "Keine"
-                try:
-                    day, hour_s = slot.split("-")
-                    hour = int(hour_s)
-                    timestr = slot_label_range(day, hour)
-                except Exception:
-                    timestr = slot
-                idx += 1
-                embed.add_field(name=f"{idx}. {opt_text}", value=f"{timestr}\nTeilnehmende: {names_line}", inline=False)
-                match_entries.append({"opt_text": opt_text, "slot": slot, "users": users})
-        matches_key = f"matches:{interaction.user.id}:{self.poll_id}"
-        create_event_temp_storage[matches_key] = {"entries": match_entries}
-        view = discord.ui.View(timeout=180)
-        for i in range(min(len(match_entries), 20)):
-            view.add_item(MatchButton(self.poll_id, matches_key, i))
-        view.add_item(NewEventButton(self.poll_id, matches_key))
-        if not match_entries:
-            embed.description = "Keine Matches gefunden. Wähle 'Neues Event' um ein Event manuell zu erstellen."
-        else:
-            embed.set_footer(text="Wähle eine Option unten, um die Event-Erstellung zu starten.")
-        try:
-            await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
-        except Exception:
-            log.exception("Failed to open matches view from CreateEventButton")
-
-# CreateEventStep1Modal: on_submit now directly opens Step2 modal (no intermediate ephemeral)
-class CreateEventStep1Modal(discord.ui.Modal, title="Event: Titel & Beschreibung"):
-    title_field = discord.ui.TextInput(label="Titel", style=discord.TextStyle.short, max_length=100)
-    description_field = discord.ui.TextInput(label="Beschreibung (optional)", style=discord.TextStyle.long, required=False, max_length=2000)
-    def __init__(self, tmp_key: str):
-        super().__init__(title="Event: Titel & Beschreibung")
-        self.tmp_key = tmp_key
-        data = create_event_temp_storage.get(tmp_key, {})
-        self.title_field.default = str(data.get("opt_text", "")) if data.get("opt_text", None) is not None else ""
-        self.description_field.default = str(data.get("description", "")) if data.get("description", None) is not None else ""
-    async def on_submit(self, interaction: discord.Interaction):
-        try:
-            tmp = create_event_temp_storage.setdefault(self.tmp_key, {})
-            tmp["title"] = str(self.title_field.value).strip() or tmp.get("opt_text", "") or "Event"
-            tmp["description"] = str(self.description_field.value).strip()
-            # Directly open Step2 modal. This may raise on some library/client combos;
-            # we catch exceptions and fallback to ephemeral info if needed.
-            modal = create_step2_modal_instance(self.tmp_key)
-            try:
-                await interaction.response.send_modal(modal)
-            except Exception:
-                log.exception("Failed to open CreateEvent Step2 modal directly from Step1")
-                try:
-                    await interaction.response.send_message("Fehler beim Öffnen des nächsten Schritts. Bitte versuche es erneut.", ephemeral=True)
-                except Exception:
-                    pass
-        except Exception:
-            log.exception("Unhandled error in CreateEventStep1Modal.on_submit")
-            try:
-                await interaction.response.send_message("Interner Fehler beim Verarbeiten des Formulars.", ephemeral=True)
-            except Exception:
-                pass
-
-# TextInput-based Step2 modal (fallback)
-class CreateEventStep2Modal_TextInput(discord.ui.Modal, title="Event: Datum, Zeit & Ort"):
-    start_date_field = discord.ui.TextInput(label="Startdatum", style=discord.TextStyle.short, placeholder="01.01.2026", max_length=20)
-    end_date_field = discord.ui.TextInput(label="Enddatum", style=discord.TextStyle.short, placeholder="01.01.2026", max_length=20)
-    start_field = discord.ui.TextInput(label="Beginn", style=discord.TextStyle.short, placeholder="18:00", max_length=8)
-    end_field = discord.ui.TextInput(label="Ende", style=discord.TextStyle.short, placeholder="20:00", max_length=8)
-    location_field = discord.ui.TextInput(label="Ort", style=discord.TextStyle.short, required=False, max_length=200)
-    def __init__(self, tmp_key: str):
-        super().__init__(title="Event: Datum, Zeit & Ort")
-        self.tmp_key = tmp_key
-        data = create_event_temp_storage.get(tmp_key, {})
-        self.start_date_field.default = str(data.get("default_start_date", "")) if data.get("default_start_date", None) is not None else ""
-        self.end_date_field.default = str(data.get("default_end_date", "")) if data.get("default_end_date", None) is not None else ""
-        self.start_field.default = str(data.get("default_start", "18:00"))
-        self.end_field.default = str(data.get("default_end", "19:00"))
-        self.location_field.default = str(data.get("default_location", "")) if data.get("default_location", None) is not None else ""
-    async def on_submit(self, interaction: discord.Interaction):
-        try:
-            tmp = create_event_temp_storage.setdefault(self.tmp_key, {})
-            start_date_str = str(self.start_date_field.value).strip()
-            end_date_str = str(self.end_date_field.value).strip()
-            start_time_str = str(self.start_field.value).strip()
-            end_time_str = str(self.end_field.value).strip()
-            location = str(self.location_field.value).strip()
-
-            start_date = parse_date_ddmmyyyy(start_date_str)
-            end_date = parse_date_ddmmyyyy(end_date_str)
-            start_time = parse_time_hhmm(start_time_str)
-            end_time = parse_time_hhmm(end_time_str)
-
-            if not start_date or not end_date or not start_time or not end_time:
-                try:
-                    await interaction.response.send_message("Datum/Uhrzeit konnte nicht geparst. Bitte benutze DD.MM.YYYY und HH:MM.", ephemeral=True)
-                except Exception:
-                    log.exception("Failed to send invalid-date ephemeral from Step2")
-                return
-
-            tz = ZoneInfo(POST_TIMEZONE)
-            start_dt = datetime(start_date.year, start_date.month, start_date.day, start_time.hour, start_time.minute, tzinfo=tz)
-            end_dt = datetime(end_date.year, end_date.month, end_date.day, end_time.hour, end_time.minute, tzinfo=tz)
-
-            tmp.update({
-                "start_dt": start_dt.isoformat(),
-                "end_dt": end_dt.isoformat(),
-                "location": location or tmp.get("default_location", ""),
-                "participants_text": tmp.get("participants_text", tmp.get("mentions", "")),
-            })
-
-            view = FinalizeEventView(self.tmp_key, interaction.user.id)
-            summary_lines = [
-                f"**Titel:** {tmp.get('title')}",
-                f"**Startdatum:** {start_date.strftime('%d.%m.%Y')}",
-                f"**Beginn:** {start_time.strftime('%H:%M')}",
-                f"**Enddatum:** {end_date.strftime('%d.%m.%Y')}",
-                f"**Ende:** {end_time.strftime('%H:%M')}",
-                f"**Ort:** {tmp.get('location') or '—'}",
-                f"**Teilnehmende:** {tmp.get('participants_text') or '—'}",
-            ]
-            try:
-                await interaction.response.send_message("Event-Entwurf:\n" + "\n".join(summary_lines), view=view, ephemeral=True)
-            except Exception:
-                log.exception("Failed to send event draft after Step2 submit")
-        except Exception:
-            log.exception("Unhandled error in CreateEventStep2Modal_TextInput.on_submit")
-            try:
-                await interaction.response.send_message("Interner Fehler beim Verarbeiten des Formulars.", ephemeral=True)
-            except Exception:
-                pass
-
-# Factory: always return TextInput modal to avoid Invalid Form Body errors
-def create_step2_modal_instance(tmp_key: str) -> discord.ui.Modal:
-    return CreateEventStep2Modal_TextInput(tmp_key)
-
-# EditParticipantsModal, EditDescriptionLocationModal, FinalizeEventView, EventSignupView, build_created_event_embed etc.
-class EditParticipantsModal(discord.ui.Modal, title="Teilnehmende bearbeiten"):
-    participants_field = discord.ui.TextInput(label="Teilnehmende (Erwähnungen, z.B. @user)", style=discord.TextStyle.long, required=False, max_length=1000)
-    def __init__(self, tmp_key: str):
-        super().__init__(title="Teilnehmende bearbeiten")
-        self.tmp_key = tmp_key
-        data = create_event_temp_storage.get(tmp_key, {})
-        self.participants_field.default = data.get("participants_text", "")
-    async def on_submit(self, interaction: discord.Interaction):
-        tmp = create_event_temp_storage.setdefault(self.tmp_key, {})
-        tmp["participants_text"] = str(self.participants_field.value).strip()
-        try:
-            await interaction.response.send_message("Teilnehmende gespeichert.", ephemeral=True)
-        except Exception:
-            log.exception("Failed to ack participants save")
-
-class EditDescriptionLocationModal(discord.ui.Modal):
-    description_field = discord.ui.TextInput(label="Beschreibung (optional)", style=discord.TextStyle.long, required=False, max_length=2000)
-    location_field = discord.ui.TextInput(label="Ort (Voice-Channel-Name oder Text)", required=False, max_length=200)
-    def __init__(self, tmp_key: str):
-        super().__init__(title="Ort & Beschreibung bearbeiten")
-        self.tmp_key = tmp_key
-        data = create_event_temp_storage.get(tmp_key, {})
-        self.description_field.default = data.get("description", "")
-        self.location_field.default = data.get("location", "")
-    async def on_submit(self, interaction: discord.Interaction):
-        tmp = create_event_temp_storage.get(self.tmp_key, {})
-        tmp["description"] = str(self.description_field.value).strip()
-        tmp["location"] = str(self.location_field.value).strip()
-        try:
-            await interaction.response.send_message("Beschreibung & Ort gespeichert. Du kannst jetzt das Event erstellen.", ephemeral=True)
-        except Exception:
-            log.exception("Failed to ack desc/location save")
-
-class FinalizeEventView(discord.ui.View):
-    def __init__(self, tmp_key: str, owner_user_id: int):
-        super().__init__(timeout=300)
-        self.tmp_key = tmp_key
-        self.owner_user_id = owner_user_id
-
-    @discord.ui.button(label="Teilnehmende bearbeiten", style=discord.ButtonStyle.secondary)
-    async def edit_participants(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if interaction.user.id != self.owner_user_id:
-            try:
-                await interaction.response.send_message("Nur der Ersteller kann das bearbeiten.", ephemeral=True)
-            except Exception:
-                pass
-            return
-        modal = EditParticipantsModal(self.tmp_key)
+        modal = CreateEventModal(self.poll_id)
         try:
             await interaction.response.send_modal(modal)
         except Exception:
-            log.exception("Failed to open EditParticipantsModal")
-            try:
-                await interaction.response.send_message("Fehler beim Öffnen des Teilnehmenden-Modals.", ephemeral=True)
-            except Exception:
-                pass
+            log.exception("Failed to send CreateEventModal")
 
-    @discord.ui.button(label="Ort & Beschreibung bearbeiten", style=discord.ButtonStyle.secondary)
-    async def edit_desc_loc(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if interaction.user.id != self.owner_user_id:
-            try:
-                await interaction.response.send_message("Nur der Ersteller kann das bearbeiten.", ephemeral=True)
-            except Exception:
-                pass
-            return
-        modal = EditDescriptionLocationModal(self.tmp_key)
-        try:
-            await interaction.response.send_modal(modal)
-        except Exception:
-            log.exception("Failed to open EditDescriptionLocationModal")
-            try:
-                await interaction.response.send_message("Fehler beim Öffnen des Beschreibungs-Modals.", ephemeral=True)
-            except Exception:
-                pass
+# -------------------------
+# Removed: All step1/step2, Match/New buttons, create_step2_modal_instance, EditParticipantsModal, EditDescriptionLocationModal, FinalizeEventView etc.
+# -------------------------
 
-    @discord.ui.button(label="Event erstellen", style=discord.ButtonStyle.success)
-    async def finalize(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if interaction.user.id != self.owner_user_id:
-            try:
-                await interaction.response.send_message("Nur der Ersteller kann das finalisieren.", ephemeral=True)
-            except Exception:
-                pass
-            return
-        tmp = create_event_temp_storage.get(self.tmp_key, {})
-        title = tmp.get("title")
-        start_iso = tmp.get("start_dt")
-        end_iso = tmp.get("end_dt")
-        participants_text = tmp.get("participants_text", "")
-        description = tmp.get("description", "")
-        location = tmp.get("location", "")
-        poll_id = tmp.get("poll_id")
-        event_id = datetime.now(tz=ZoneInfo(POST_TIMEZONE)).strftime("%Y%m%dT%H%M%S") + "-" + str(interaction.user.id)
-        created_at = datetime.now(timezone.utc).isoformat()
+async def build_created_event_embed(event_id: str, guild: Optional[discord.Guild] = None) -> discord.Embed:
+    rows = db_execute("SELECT title, description, start_time, end_time, participants, location FROM created_events WHERE id = ?", (event_id,), fetch=True) or []
+    if not rows:
+        return discord.Embed(title="Event", description="(Details fehlen)", color=discord.Color.dark_grey())
+    title, description, start_iso, end_iso, participants_text, location = rows[0]
+    embed = discord.Embed(title=f"📣 {title}", description=description or "", color=discord.Color.orange(), timestamp=datetime.now(timezone.utc))
+    if start_iso:
         try:
-            db_execute("INSERT INTO created_events(id, poll_id, title, description, start_time, end_time, participants, location, posted_channel_id, posted_message_id, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                       (event_id, poll_id, title, description, start_iso, end_iso, participants_text, location, None, None, created_at))
+            dt = datetime.fromisoformat(start_iso)
+            embed.add_field(name="Startdatum", value=dt.strftime("%d.%m.%Y"), inline=True)
+            embed.add_field(name="Beginn", value=dt.strftime("%H:%M"), inline=True)
         except Exception:
-            log.exception("Failed inserting created_event")
-            try:
-                await interaction.response.send_message("Fehler beim Speichern des Events.", ephemeral=True)
-            except Exception:
-                pass
-            return
-
-        # automatically add creator as interested
+            embed.add_field(name="Start", value=start_iso, inline=False)
+    if end_iso:
         try:
-            creator_uid = interaction.user.id
-            db_execute("INSERT OR IGNORE INTO created_event_rsvps(event_id, user_id) VALUES (?, ?)", (event_id, creator_uid))
+            dt = datetime.fromisoformat(end_iso)
+            embed.add_field(name="Enddatum", value=dt.strftime("%d.%m.%Y"), inline=True)
+            embed.add_field(name="Ende", value=dt.strftime("%H:%M"), inline=True)
         except Exception:
-            log.exception("Failed adding creator to RSVPs")
-
-        target_channel = None
-        if CREATED_EVENTS_CHANNEL_ID:
-            target_channel = bot.get_channel(CREATED_EVENTS_CHANNEL_ID)
-        if not target_channel and CHANNEL_ID:
-            target_channel = bot.get_channel(CHANNEL_ID)
-        if not target_channel and isinstance(interaction.channel, discord.TextChannel):
-            target_channel = interaction.channel
-        if not target_channel:
-            try:
-                await interaction.response.send_message("Kein Zielkanal gefunden, um das Event zu posten. Bitte admin: setze CREATED_EVENTS_CHANNEL_ID oder CHANNEL_ID.", ephemeral=True)
-            except Exception:
-                pass
-            return
-        try:
-            start_dt = datetime.fromisoformat(start_iso) if start_iso else None
-        except Exception:
-            start_dt = None
-        try:
-            end_dt = datetime.fromisoformat(end_iso) if end_iso else None
-        except Exception:
-            end_dt = None
-
-        embed = discord.Embed(title=f"📣 {title}", description=description or "", color=discord.Color.orange(), timestamp=datetime.now(timezone.utc))
-        if start_dt:
-            try:
-                embed.add_field(name="Startdatum", value=start_dt.strftime("%d.%m.%Y"), inline=True)
-                embed.add_field(name="Beginn", value=start_dt.strftime("%H:%M"), inline=True)
-            except Exception:
-                embed.add_field(name="Start", value=str(start_dt), inline=False)
-        if end_dt:
-            try:
-                embed.add_field(name="Enddatum", value=end_dt.strftime("%d.%m.%Y"), inline=True)
-                embed.add_field(name="Ende", value=end_dt.strftime("%H:%M"), inline=True)
-            except Exception:
-                embed.add_field(name="Ende", value=str(end_dt), inline=False)
-        if participants_text:
-            embed.add_field(name="Teilnehmende", value=participants_text, inline=False)
-        if location:
-            embed.add_field(name="Ort", value=location, inline=False)
-
-        view = EventSignupView(event_id)
-        try:
-            bot.add_view(view)
-        except Exception:
-            pass
-        try:
-            sent = await target_channel.send(embed=embed, view=view)
-            db_execute("UPDATE created_events SET posted_channel_id = ?, posted_message_id = ? WHERE id = ?", (target_channel.id, sent.id, event_id))
-        except Exception:
-            log.exception("Failed posting created event to channel")
-            try:
-                await interaction.response.send_message("Fehler beim Posten des Events.", ephemeral=True)
-            except Exception:
-                pass
-            return
-        if start_dt:
-            schedule_reminders_for_created_event(event_id, start_dt, target_channel.id)
-        try:
-            create_event_temp_storage.pop(self.tmp_key, None)
-        except Exception:
-            pass
-        try:
-            await interaction.response.send_message("✅ Event erstellt und gepostet.", ephemeral=True)
-        except Exception:
-            pass
+            embed.add_field(name="Ende", value=end_iso, inline=False)
+    if participants_text:
+        embed.add_field(name="Teilnehmende", value=participants_text, inline=False)
+    rows2 = db_execute("SELECT user_id FROM created_event_rsvps WHERE event_id = ?", (event_id,), fetch=True) or []
+    user_ids = [r[0] for r in rows2]
+    if user_ids:
+        names = [user_display_name(guild, uid) for uid in user_ids]
+        embed.add_field(name="Interessiert", value=", ".join(names[:20]) + (f", und {len(names)-20} weitere..." if len(names)>20 else ""), inline=False)
+    else:
+        embed.add_field(name="Interessiert", value="Keine", inline=False)
+    if location:
+        embed.add_field(name="Ort", value=location, inline=False)
+    return embed
 
 class EventSignupView(discord.ui.View):
     def __init__(self, event_id: str):
@@ -1035,39 +791,6 @@ class EventSignupView(discord.ui.View):
                         log.exception("Failed editing created event message after RSVP")
         except Exception:
             log.exception("Failed to update posted message after RSVP toggle")
-
-async def build_created_event_embed(event_id: str, guild: Optional[discord.Guild] = None) -> discord.Embed:
-    rows = db_execute("SELECT title, description, start_time, end_time, participants, location FROM created_events WHERE id = ?", (event_id,), fetch=True) or []
-    if not rows:
-        return discord.Embed(title="Event", description="(Details fehlen)", color=discord.Color.dark_grey())
-    title, description, start_iso, end_iso, participants_text, location = rows[0]
-    embed = discord.Embed(title=f"📣 {title}", description=description or "", color=discord.Color.orange(), timestamp=datetime.now(timezone.utc))
-    if start_iso:
-        try:
-            dt = datetime.fromisoformat(start_iso)
-            embed.add_field(name="Startdatum", value=dt.strftime("%d.%m.%Y"), inline=True)
-            embed.add_field(name="Beginn", value=dt.strftime("%H:%M"), inline=True)
-        except Exception:
-            embed.add_field(name="Start", value=start_iso, inline=False)
-    if end_iso:
-        try:
-            dt = datetime.fromisoformat(end_iso)
-            embed.add_field(name="Enddatum", value=dt.strftime("%d.%m.%Y"), inline=True)
-            embed.add_field(name="Ende", value=dt.strftime("%H:%M"), inline=True)
-        except Exception:
-            embed.add_field(name="Ende", value=end_iso, inline=False)
-    if participants_text:
-        embed.add_field(name="Teilnehmende", value=participants_text, inline=False)
-    rows2 = db_execute("SELECT user_id FROM created_event_rsvps WHERE event_id = ?", (event_id,), fetch=True) or []
-    user_ids = [r[0] for r in rows2]
-    if user_ids:
-        names = [user_display_name(guild, uid) for uid in user_ids]
-        embed.add_field(name="Interessiert", value=", ".join(names[:20]) + (f", und {len(names)-20} weitere..." if len(names)>20 else ""), inline=False)
-    else:
-        embed.add_field(name="Interessiert", value="Keine", inline=False)
-    if location:
-        embed.add_field(name="Ort", value=location, inline=False)
-    return embed
 
 # Poll button & PollView
 class PollButton(discord.ui.Button):
