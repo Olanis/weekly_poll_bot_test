@@ -3,7 +3,7 @@
 bot.py — Event creation: Single modal with flexible parsing, creates Bot Event only (no Discord Scheduled Event).
 Embed layout adjusted: no confirmation on idea delete, no icons in event embed, matches back in poll embed.
 Daily summary now shows only new matches since last post.
-Added quarterly poll with day-based availability, improved navigation within one message, fixed view attribute access, added labels for sections, fixed PollView definition, fixed day selection persistence.
+Added quarterly poll with day-based availability, improved navigation within one message, fixed view attribute access, added labels for sections, fixed PollView definition, fixed day selection persistence, updated week calculation to Monday-Sunday.
 
 Replace your running bot.py with this file and restart the bot.
 """
@@ -267,19 +267,26 @@ def get_quarter_months(start_date: date) -> List[str]:
     return months
 
 def get_month_weeks(month_str: str) -> List[Tuple[str, date, date]]:
-    # month_str like "Jan. 2026"
     month_name, year_s = month_str.split(". ")
     year = int(year_s)
     month = MONTHS.index(month_name) + 1
     first_day = date(year, month, 1)
+    last_day = date(year, month + 1, 1) - timedelta(days=1) if month < 12 else date(year+1, 1, 1) - timedelta(days=1)
     weeks = []
     current = first_day
-    while current.month == month:
-        week_start = current
-        week_end = min(week_start + timedelta(days=6), date(year, month + 1, 1) - timedelta(days=1) if month < 12 else date(year+1, 1, 1) - timedelta(days=1))
-        label = f"{week_start.strftime('%d.%m.')}-{week_end.strftime('%d.%m.')}"
-        weeks.append((label, week_start, week_end))
-        current = week_end + timedelta(days=1)
+    week_num = 1
+    while current <= last_day:
+        # Find the Monday of the week containing current
+        monday = current - timedelta(days=current.weekday())  # weekday() 0=Mon, 6=Sun
+        sunday = monday + timedelta(days=6)
+        # Clip to the month
+        start = max(monday, first_day)
+        end = min(sunday, last_day)
+        if start <= end:
+            label = f"Woche {week_num}"
+            weeks.append((label, start, end))
+            week_num += 1
+        current = sunday + timedelta(days=1)
     return weeks
 
 def get_week_days(week_start: date, week_end: date) -> List[str]:
