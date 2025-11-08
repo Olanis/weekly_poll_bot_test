@@ -1336,6 +1336,7 @@ class EventSignupView(discord.ui.View):
         self.add_item(btn)
 
     async def toggle_interested(self, interaction: discord.Interaction):
+        await interaction.response.defer()  # Defer to avoid timeout
         uid = interaction.user.id
         try:
             existing = db_execute("SELECT 1 FROM created_event_rsvps WHERE event_id = ? AND user_id = ?", (self.event_id, uid), fetch=True)
@@ -1837,4 +1838,3 @@ if __name__ == "__main__":
         raise SystemExit(1)
     init_db()
     bot.run(BOT_TOKEN)
-
