@@ -1341,20 +1341,16 @@ class EventSignupView(discord.ui.View):
             existing = db_execute("SELECT 1 FROM created_event_rsvps WHERE event_id = ? AND user_id = ?", (self.event_id, uid), fetch=True)
             if existing:
                 db_execute("DELETE FROM created_event_rsvps WHERE event_id = ? AND user_id = ?", (self.event_id, uid))
-                is_now_interested = False
             else:
                 db_execute("INSERT OR IGNORE INTO created_event_rsvps(event_id, user_id) VALUES (?, ?)", (self.event_id, uid))
-                is_now_interested = True
         except Exception:
             log.exception("Error toggling RSVP")
-        # Send ephemeral confirmation instead of editing the message
+        # Update the message with new embed
         try:
-            await interaction.response.send_message(
-                "✅ Du bist jetzt interessiert!" if is_now_interested else "❌ Du bist nicht mehr interessiert!",
-                ephemeral=True
-            )
+            embed = await build_created_event_embed(self.event_id, interaction.guild)
+            await interaction.message.edit(embed=embed)
         except Exception:
-            pass
+            log.exception("Failed to update event message after RSVP")
 
 # -------------------------
 # Reminders, posting, scheduling, commands (unchanged flow)
@@ -1841,3 +1837,4 @@ if __name__ == "__main__":
         raise SystemExit(1)
     init_db()
     bot.run(BOT_TOKEN)
+
