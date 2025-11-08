@@ -3,7 +3,7 @@
 bot.py — Event creation: Single modal with flexible parsing, creates Bot Event only (no Discord Scheduled Event).
 Embed layout adjusted: no confirmation on idea delete, no icons in event embed, matches back in poll embed.
 Daily summary now shows only new matches since last post.
-Added quarterly poll with day-based availability, improved navigation within one message, fixed view attribute access, added labels for sections, fixed PollView definition, fixed day selection persistence, updated week calculation to Monday-Sunday, removed checkmarks from weekly poll, added weekly summary for quarterly poll, fixed persistent day display in quarterly poll, fixed event RSVP button state per user, reduced critical database operations to avoid filters.
+Added quarterly poll with day-based availability, improved navigation within one message, fixed view attribute access, added labels for sections, fixed PollView definition, fixed day selection persistence, updated week calculation to Monday-Sunday, removed checkmarks from weekly poll, added weekly summary for quarterly poll, fixed persistent day display in quarterly poll, fixed event RSVP button state per user, reduced critical database operations to avoid filters, made location optional in event creation, removed location from event embed if not set, added show matches button.
 
 Replace your running bot.py with this file and restart the bot.
 """
@@ -415,27 +415,6 @@ def generate_poll_embed_from_db(poll_id: str, guild: Optional[discord.Guild] = N
             value = header + "\n👥 " + names_line
         else:
             value = header + "\n👥 Keine Stimmen"
-        if len(voters) >= 2:
-            avail_rows = get_availability_for_poll(poll_id)
-            slot_map = {}
-            for uid, slot in avail_rows:
-                if uid in voters:
-                    slot_map.setdefault(slot, []).append(uid)
-            common = [(s, ulist) for s, ulist in slot_map.items() if len(ulist) >= 2]
-            if common:
-                max_count = max(len(ulist) for (_, ulist) in common)
-                best = [(s, ulist) for (s, ulist) in common if len(ulist) == max_count]
-                lines = []
-                for s, ulist in best:
-                    try:
-                        day, hour_s = s.split("-")
-                        hour = int(hour_s)
-                        timestr = slot_label_range(day, hour)
-                    except Exception:
-                        timestr = s
-                    names = [user_display_name(guild, u) for u in ulist]
-                    lines.append(f"{timestr}: {', '.join(names)}")
-                value += "\n✅ Gemeinsame Zeit (beliebteste):\n" + "\n".join(lines)
         embed.add_field(name=opt_text or "(ohne Titel)", value=value, inline=False)
     return embed
 
@@ -465,21 +444,6 @@ def generate_quarterly_poll_embed_from_db(poll_id: str, guild: Optional[discord.
             value = header + "\n👥 " + names_line
         else:
             value = header + "\n👥 Keine Stimmen"
-        if len(voters) >= 2:
-            avail_rows = get_availability_for_poll(poll_id)
-            slot_map = {}
-            for uid, slot in avail_rows:
-                if uid in voters:
-                    slot_map.setdefault(slot, []).append(uid)
-            common = [(s, ulist) for s, ulist in slot_map.items() if len(ulist) >= 2]
-            if common:
-                max_count = max(len(ulist) for (_, ulist) in common)
-                best = [(s, ulist) for (s, ulist) in common if len(ulist) == max_count]
-                lines = []
-                for s, ulist in best:
-                    names = [user_display_name(guild, u) for u in ulist]
-                    lines.append(f"{s}: {', '.join(names)}")
-                value += "\n✅ Gemeinsame Tage (beliebteste):\n" + "\n".join(lines)
         embed.add_field(name=opt_text or "(ohne Titel)", value=value, inline=False)
     return embed
 
@@ -788,6 +752,43 @@ class QuarterlyAvailabilityView(discord.ui.View):
         submit = QuarterlySubmitButton(poll_id)
         self.add_item(submit)
 
+class ShowMatchesButton(discord.ui.Button):
+    def __init__(self, poll_id: str):
+        super().__init__(label="🤝 Matches anzeigen", style=discord.ButtonStyle.success)
+        self.poll_id = poll_id
+    async def callback(self, interaction: discord.Interaction):
+        matches = compute_matches_for_poll_from_db(self.poll_id)
+        if not matches:
+            embed = discord.Embed(
+                title="🤝 Keine Matches gefunden",
+                description="Es gibt noch keine gemeinsamen Zeiten oder Tage mit genügend Teilnehmern.",
+                color=discord.Color.blue()
+            )
+        else:
+            embed = discord.Embed(
+                title="🤝 Beste Matches",
+                description="Hier sind die Optionen mit den meisten gemeinsamen Zeiten/Tagen:",
+                color=discord.Color.blue()
+            )
+            for opt_text, infos in matches.items():
+                lines = []
+                for info in infos:
+                    slot = info["slot"]
+                    if "-" in slot:
+                        day, hour_s = slot.split("-")
+                        hour = int(hour_s)
+                        time_str = slot_label_range(day, hour)
+                    else:
+                        time_str = slot
+                    users = info["users"]
+                    names = [user_display_name(interaction.guild, u) for u in users]
+                    lines.append(f"{time_str}: {', '.join(names)}")
+                embed.add_field(name=opt_text, value="\n".join(lines), inline=False)
+        try:
+            await interaction.response.send_message(embed=embed, ephemeral=True)
+        except Exception:
+            log.exception("Failed to send matches embed")
+
 class PollView(discord.ui.View):
     def __init__(self, poll_id: str):
         super().__init__(timeout=None)
@@ -808,6 +809,10 @@ class PollView(discord.ui.View):
             pass
         try:
             self.add_item(CreateEventButton(poll_id))
+        except Exception:
+            pass
+        try:
+            self.add_item(ShowMatchesButton(poll_id))
         except Exception:
             pass
         try:
@@ -992,7 +997,7 @@ class CreateEventModal(discord.ui.Modal, title="Event erstellen"):
     description_field = discord.ui.TextInput(label="Beschreibung", style=discord.TextStyle.long, required=False, max_length=2000)
     date_range_field = discord.ui.TextInput(label="Datumsbereich", style=discord.TextStyle.short, placeholder="01.01.2026 - 02.01.2026", max_length=40)
     time_range_field = discord.ui.TextInput(label="Zeitbereich", style=discord.TextStyle.short, placeholder="18:00 - 20:00", max_length=20)
-    location_field = discord.ui.TextInput(label="Ort", style=discord.TextStyle.short, placeholder="#channelname oder Text", max_length=200)
+    location_field = discord.ui.TextInput(label="Ort", style=discord.TextStyle.short, placeholder="#channelname oder Text", max_length=200, required=False)
 
     def __init__(self, poll_id: str, prefill_title: str = "", prefill_date: str = "", prefill_time: str = ""):
         super().__init__(title="Event erstellen")
@@ -1085,7 +1090,8 @@ class CreateEventModal(discord.ui.Modal, title="Event erstellen"):
                 wann_value = f"{start_str} – {end_str}"
             embed.add_field(name="Wann", value=wann_value, inline=False)
 
-            embed.add_field(name="Ort", value=location or "Nicht angegeben", inline=False)
+            if location:
+                embed.add_field(name="Ort", value=location, inline=False)
 
             rows2 = safe_db_query("SELECT user_id FROM created_event_rsvps WHERE event_id = ?", (event_id,), fetch=True) or []
             user_ids = [r[0] for r in rows2]
@@ -1163,6 +1169,10 @@ class QuarterlyPollView(discord.ui.View):
             pass
         try:
             self.add_item(CreateEventButton(poll_id))
+        except Exception:
+            pass
+        try:
+            self.add_item(ShowMatchesButton(poll_id))
         except Exception:
             pass
         try:
