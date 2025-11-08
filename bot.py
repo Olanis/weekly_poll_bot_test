@@ -3,7 +3,7 @@
 bot.py — Event creation: Single modal with flexible parsing, creates Bot Event only (no Discord Scheduled Event).
 Embed layout adjusted: no confirmation on idea delete, no icons in event embed, matches back in poll embed.
 Daily summary now shows only new matches since last post.
-Added quarterly poll with day-based availability, improved navigation within one message, fixed view attribute access, added labels for sections, fixed PollView definition, fixed day selection persistence, updated week calculation to Monday-Sunday, removed checkmarks from weekly poll, added weekly summary for quarterly poll, fixed persistent day display in quarterly poll, fixed event RSVP button state per user, reduced critical database operations to avoid filters, made location optional in event creation, removed location from event embed if not set, added show matches button, fixed delete button interaction.
+Added quarterly poll with day-based availability, improved navigation within one message, fixed view attribute access, added labels for sections, fixed PollView definition, fixed day selection persistence, updated week calculation to Monday-Sunday, removed checkmarks from weekly poll, added weekly summary for quarterly poll, fixed persistent day display in quarterly poll, fixed event RSVP button state per user, reduced critical database operations to avoid filters, made location optional in event creation, removed location from event embed if not set, added show matches button, fixed delete button interaction, added date/time prefill for quarterly matches, made matches toggle in embed.
 
 Replace your running bot.py with this file and restart the bot.
 """
@@ -390,7 +390,7 @@ def set_last_posted_weekly_matches(poll_id: str, matches: dict):
     safe_db_query("INSERT OR REPLACE INTO last_posted_weekly_matches(poll_id, matches, updated_at) VALUES (?, ?, ?)",
                (poll_id, matches_str, now))
 
-def generate_poll_embed_from_db(poll_id: str, guild: Optional[discord.Guild] = None):
+def generate_poll_embed_from_db(poll_id: str, guild: Optional[discord.Guild] = None, show_matches_flag: bool = False):
     options = get_options(poll_id)
     votes = get_votes_for_poll(poll_id)
     votes_map = {}
@@ -416,9 +416,28 @@ def generate_poll_embed_from_db(poll_id: str, guild: Optional[discord.Guild] = N
         else:
             value = header + "\n👥 Keine Stimmen"
         embed.add_field(name=opt_text or "(ohne Titel)", value=value, inline=False)
+    if show_matches_flag:
+        matches = compute_matches_for_poll_from_db(poll_id)
+        if matches:
+            for opt_text, infos in matches.items():
+                lines = []
+                for info in infos:
+                    slot = info["slot"]
+                    if "-" in slot:
+                        day, hour_s = slot.split("-")
+                        hour = int(hour_s)
+                        timestr = slot_label_range(day, hour)
+                    else:
+                        timestr = slot
+                    users = info["users"]
+                    names = [user_display_name(guild, u) for u in users]
+                    lines.append(f"{timestr}: {', '.join(names)}")
+                embed.add_field(name=f"🤝 Beste Matches — {opt_text}", value="\n".join(lines), inline=False)
+        else:
+            embed.add_field(name="🤝 Beste Matches", value="Keine gemeinsamen Zeiten gefunden.", inline=False)
     return embed
 
-def generate_quarterly_poll_embed_from_db(poll_id: str, guild: Optional[discord.Guild] = None):
+def generate_quarterly_poll_embed_from_db(poll_id: str, guild: Optional[discord.Guild] = None, show_matches_flag: bool = False):
     options = get_options(poll_id)
     votes = get_votes_for_poll(poll_id)
     votes_map = {}
@@ -445,10 +464,30 @@ def generate_quarterly_poll_embed_from_db(poll_id: str, guild: Optional[discord.
         else:
             value = header + "\n👥 Keine Stimmen"
         embed.add_field(name=opt_text or "(ohne Titel)", value=value, inline=False)
+    if show_matches_flag:
+        matches = compute_matches_for_poll_from_db(poll_id)
+        if matches:
+            for opt_text, infos in matches.items():
+                lines = []
+                for info in infos:
+                    slot = info["slot"]
+                    if "-" in slot:
+                        day, hour_s = slot.split("-")
+                        hour = int(hour_s)
+                        timestr = slot_label_range(day, hour)
+                    else:
+                        timestr = slot
+                    users = info["users"]
+                    names = [user_display_name(guild, u) for u in users]
+                    lines.append(f"{timestr}: {', '.join(names)}")
+                embed.add_field(name=f"🤝 Beste Matches — {opt_text}", value="\n".join(lines), inline=False)
+        else:
+            embed.add_field(name="🤝 Beste Matches", value="Keine gemeinsamen Tage gefunden.", inline=False)
     return embed
 
 temp_selections: Dict[str, Dict[int, Set[str]]] = {}
 create_event_temp_storage: Dict[str, Dict] = {}
+show_matches: Dict[str, bool] = {}
 
 class SuggestModal(discord.ui.Modal, title="Neue Idee hinzufügen"):
     idea = discord.ui.TextInput(label="Deine Idee", placeholder="z. B. Minecraft zocken", max_length=100)
@@ -470,7 +509,7 @@ class SuggestModal(discord.ui.Modal, title="Neue Idee hinzufügen"):
                     if msg.author == bot.user and msg.embeds:
                         em = msg.embeds[0]
                         if "Worauf" in em.title or "Quartalsumfrage" in em.title:
-                            embed = generate_poll_embed_from_db(self.poll_id, interaction.guild) if "Worauf" in em.title else generate_quarterly_poll_embed_from_db(self.poll_id, interaction.guild)
+                            embed = generate_poll_embed_from_db(self.poll_id, interaction.guild, show_matches_flag=show_matches.get(self.poll_id, False)) if "Worauf" in em.title else generate_quarterly_poll_embed_from_db(self.poll_id, interaction.guild, show_matches_flag=show_matches.get(self.poll_id, False))
                             try:
                                 bot.add_view(PollView(self.poll_id) if "Worauf" in em.title else QuarterlyPollView(self.poll_id))
                             except Exception:
@@ -757,37 +796,12 @@ class ShowMatchesButton(discord.ui.Button):
         super().__init__(label="🤝 Matches anzeigen", style=discord.ButtonStyle.success)
         self.poll_id = poll_id
     async def callback(self, interaction: discord.Interaction):
-        matches = compute_matches_for_poll_from_db(self.poll_id)
-        if not matches:
-            embed = discord.Embed(
-                title="🤝 Keine Matches gefunden",
-                description="Es gibt noch keine gemeinsamen Zeiten oder Tage mit genügend Teilnehmern.",
-                color=discord.Color.blue()
-            )
-        else:
-            embed = discord.Embed(
-                title="🤝 Beste Matches",
-                description="Hier sind die Optionen mit den meisten gemeinsamen Zeiten/Tagen:",
-                color=discord.Color.blue()
-            )
-            for opt_text, infos in matches.items():
-                lines = []
-                for info in infos:
-                    slot = info["slot"]
-                    if "-" in slot:
-                        day, hour_s = slot.split("-")
-                        hour = int(hour_s)
-                        time_str = slot_label_range(day, hour)
-                    else:
-                        time_str = slot
-                    users = info["users"]
-                    names = [user_display_name(interaction.guild, u) for u in users]
-                    lines.append(f"{time_str}: {', '.join(names)}")
-                embed.add_field(name=opt_text, value="\n".join(lines), inline=False)
+        show_matches[self.poll_id] = not show_matches.get(self.poll_id, False)
+        embed = generate_poll_embed_from_db(self.poll_id, interaction.guild, show_matches_flag=show_matches.get(self.poll_id, False)) if "_quarterly" not in self.poll_id else generate_quarterly_poll_embed_from_db(self.poll_id, interaction.guild, show_matches_flag=show_matches.get(self.poll_id, False))
         try:
-            await interaction.response.send_message(embed=embed, ephemeral=True)
+            await interaction.response.edit_message(embed=embed)
         except Exception:
-            log.exception("Failed to send matches embed")
+            log.exception("Failed to toggle matches")
 
 class PollView(discord.ui.View):
     def __init__(self, poll_id: str):
@@ -832,7 +846,7 @@ class PollButton(discord.ui.Button):
             remove_vote(self.poll_id, self.option_id, uid)
         else:
             add_vote(self.poll_id, self.option_id, uid)
-        embed = generate_poll_embed_from_db(self.poll_id, interaction.guild)
+        embed = generate_poll_embed_from_db(self.poll_id, interaction.guild, show_matches_flag=show_matches.get(self.poll_id, False))
         try:
             new_view = PollView(self.poll_id)
             bot.add_view(new_view)
@@ -882,7 +896,7 @@ class DeleteOwnOptionButtonEphemeral(discord.ui.Button):
                     if msg.author == bot.user and msg.embeds:
                         em = msg.embeds[0]
                         if "Worauf" in em.title or "Quartalsumfrage" in em.title:
-                            embed = generate_poll_embed_from_db(self.poll_id, interaction.guild) if "Worauf" in em.title else generate_quarterly_poll_embed_from_db(self.poll_id, interaction.guild)
+                            embed = generate_poll_embed_from_db(self.poll_id, interaction.guild, show_matches_flag=show_matches.get(self.poll_id, False)) if "Worauf" in em.title else generate_quarterly_poll_embed_from_db(self.poll_id, interaction.guild, show_matches_flag=show_matches.get(self.poll_id, False))
                             try:
                                 bot.add_view(PollView(self.poll_id) if "Worauf" in em.title else QuarterlyPollView(self.poll_id))
                             except Exception:
@@ -968,7 +982,10 @@ class MatchSelect(discord.ui.Select):
             time_str = f"{hour:02d}:00 - {(hour+1)%24:02d}:00"
             modal = CreateEventModal(self.poll_id, prefill_title=option_text, prefill_date=date_str, prefill_time=time_str)
         else:
-            modal = CreateEventModal(self.poll_id, prefill_title=option_text)
+            # For quarterly, set date to slot (day), time to default
+            date_str = slot
+            time_str = "10:00 - 11:00"
+            modal = CreateEventModal(self.poll_id, prefill_title=option_text, prefill_date=date_str, prefill_time=time_str)
         try:
             await interaction.response.send_modal(modal)
         except Exception:
@@ -1193,7 +1210,7 @@ class QuarterlyPollButton(discord.ui.Button):
             remove_vote(self.poll_id, self.option_id, uid)
         else:
             add_vote(self.poll_id, self.option_id, uid)
-        embed = generate_quarterly_poll_embed_from_db(self.poll_id, interaction.guild)
+        embed = generate_quarterly_poll_embed_from_db(self.poll_id, interaction.guild, show_matches_flag=show_matches.get(self.poll_id, False))
         try:
             new_view = QuarterlyPollView(self.poll_id)
             bot.add_view(new_view)
@@ -1389,7 +1406,7 @@ async def _created_event_reminder_coro(event_id: str, channel_id: int, hours_bef
 async def post_poll_to_channel(channel: discord.abc.Messageable):
     poll_id = datetime.now(tz=ZoneInfo(POST_TIMEZONE)).strftime("%Y%m%dT%H%M%S")
     create_poll_record(poll_id)
-    embed = generate_poll_embed_from_db(poll_id, channel.guild if isinstance(channel, discord.TextChannel) else None)
+    embed = generate_poll_embed_from_db(poll_id, channel.guild if isinstance(channel, discord.TextChannel) else None, show_matches_flag=show_matches.get(poll_id, False))
     view = PollView(poll_id)
     try:
         bot.add_view(view)
@@ -1401,7 +1418,7 @@ async def post_poll_to_channel(channel: discord.abc.Messageable):
 async def post_quarterly_poll_to_channel(channel: discord.abc.Messageable):
     poll_id = datetime.now(tz=ZoneInfo(POST_TIMEZONE)).strftime("%Y%m%dT%H%M%S") + "_quarterly"
     create_poll_record(poll_id)
-    embed = generate_quarterly_poll_embed_from_db(poll_id, channel.guild if isinstance(channel, discord.TextChannel) else None)
+    embed = generate_quarterly_poll_embed_from_db(poll_id, channel.guild if isinstance(channel, discord.TextChannel) else None, show_matches_flag=show_matches.get(poll_id, False))
     view = QuarterlyPollView(poll_id)
     try:
         bot.add_view(view)
