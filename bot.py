@@ -3,7 +3,7 @@
 bot.py — Event creation: Single modal with flexible parsing, creates Bot Event only (no Discord Scheduled Event).
 Embed layout adjusted: no confirmation on idea delete, no icons in event embed, matches back in poll embed.
 Daily summary now shows only new matches since last post.
-Added quarterly poll with day-based availability, improved navigation within one message, fixed view attribute access, added labels for sections, fixed PollView definition, fixed day selection persistence, updated week calculation to Monday-Sunday, removed checkmarks from weekly poll, added weekly summary for quarterly poll, fixed persistent day display in quarterly poll, fixed event RSVP button state per user, reduced critical database operations to avoid filters, made location optional in event creation, removed location from event embed if not set, added show matches button, fixed delete button interaction, added date/time prefill for quarterly matches, made matches toggle in embed.
+Added quarterly poll with day-based availability, improved navigation within one message, fixed view attribute access, added labels for sections, fixed PollView definition, fixed day selection persistence, updated week calculation to Monday-Sunday, removed checkmarks from weekly poll, added weekly summary for quarterly poll, fixed persistent day display in quarterly poll, fixed event RSVP button state per user, reduced critical database operations to avoid filters, made location optional in event creation, removed location from event embed if not set, added show matches button, fixed delete button interaction, added date/time prefill for quarterly matches, made matches toggle in embed, added weekday to event embed when start and end date are the same.
 
 Replace your running bot.py with this file and restart the bot.
 """
@@ -38,6 +38,16 @@ CHANNEL_ID = int(os.getenv("CHANNEL_ID", "0")) if os.getenv("CHANNEL_ID") else N
 CREATED_EVENTS_CHANNEL_ID = int(os.getenv("CREATED_EVENTS_CHANNEL_ID", "0")) if os.getenv("CREATED_EVENTS_CHANNEL_ID") else None
 QUARTERLY_CHANNEL_ID = int(os.getenv("QUARTERLY_CHANNEL_ID", "0")) if os.getenv("QUARTERLY_CHANNEL_ID") else None
 POST_TIMEZONE = os.getenv("POST_TIMEZONE", "Europe/Berlin")
+
+weekday_names = {
+    'Monday': 'Montag',
+    'Tuesday': 'Dienstag',
+    'Wednesday': 'Mittwoch',
+    'Thursday': 'Donnerstag',
+    'Friday': 'Freitag',
+    'Saturday': 'Samstag',
+    'Sunday': 'Sonntag'
+}
 
 def init_db():
     con = sqlite3.connect(DB_PATH)
@@ -426,12 +436,12 @@ def generate_poll_embed_from_db(poll_id: str, guild: Optional[discord.Guild] = N
                     if "-" in slot:
                         day, hour_s = slot.split("-")
                         hour = int(hour_s)
-                        timestr = slot_label_range(day, hour)
+                        time_str = slot_label_range(day, hour)
                     else:
-                        timestr = slot
+                        time_str = slot
                     users = info["users"]
                     names = [user_display_name(guild, u) for u in users]
-                    lines.append(f"{timestr}: {', '.join(names)}")
+                    lines.append(f"{time_str}: {', '.join(names)}")
                 embed.add_field(name=f"🤝 Beste Matches — {opt_text}", value="\n".join(lines), inline=False)
         else:
             embed.add_field(name="🤝 Beste Matches", value="Keine gemeinsamen Zeiten gefunden.", inline=False)
@@ -474,12 +484,12 @@ def generate_quarterly_poll_embed_from_db(poll_id: str, guild: Optional[discord.
                     if "-" in slot:
                         day, hour_s = slot.split("-")
                         hour = int(hour_s)
-                        timestr = slot_label_range(day, hour)
+                        time_str = slot_label_range(day, hour)
                     else:
-                        timestr = slot
+                        time_str = slot
                     users = info["users"]
                     names = [user_display_name(guild, u) for u in users]
-                    lines.append(f"{timestr}: {', '.join(names)}")
+                    lines.append(f"{time_str}: {', '.join(names)}")
                 embed.add_field(name=f"🤝 Beste Matches — {opt_text}", value="\n".join(lines), inline=False)
         else:
             embed.add_field(name="🤝 Beste Matches", value="Keine gemeinsamen Tage gefunden.", inline=False)
@@ -982,7 +992,6 @@ class MatchSelect(discord.ui.Select):
             time_str = f"{hour:02d}:00 - {(hour+1)%24:02d}:00"
             modal = CreateEventModal(self.poll_id, prefill_title=option_text, prefill_date=date_str, prefill_time=time_str)
         else:
-            # For quarterly, set date to slot (day), time to default
             date_str = slot
             time_str = "10:00 - 11:00"
             modal = CreateEventModal(self.poll_id, prefill_title=option_text, prefill_date=date_str, prefill_time=time_str)
@@ -1100,10 +1109,12 @@ class CreateEventModal(discord.ui.Modal, title="Event erstellen"):
             start_str = start_dt.strftime("%d.%m.%y %H:%M")
             end_str = end_dt.strftime("%d.%m.%y %H:%M")
             if start_date == end_date:
+                weekday = start_dt.strftime("%A")
+                de_weekday = weekday_names.get(weekday, weekday)
                 date_part = start_dt.strftime("%d.%m.%y")
                 time_part_start = start_dt.strftime("%H:%M")
                 time_part_end = end_dt.strftime("%H:%M")
-                wann_value = f"{date_part} {time_part_start} – {time_part_end} Uhr"
+                wann_value = f"{de_weekday}, {date_part} {time_part_start} – {time_part_end} Uhr"
             else:
                 wann_value = f"{start_str} – {end_str}"
             embed.add_field(name="Wann", value=wann_value, inline=False)
@@ -1153,7 +1164,7 @@ class CreateEventButton(discord.ui.Button):
             view = SelectMatchView(self.poll_id, matches)
             embed = discord.Embed(
                 title="🎯 Event aus Match erstellen",
-                description="Wähle ein bestehendes Match aus, um ein Event vorzubefüllen, oder erstelle ein neues.",
+                description="Wähle ein bestehendes Match aus, um ein Event vorzubefillen, oder erstelle ein neues.",
                 color=discord.Color.blue()
             )
             try:
@@ -1258,10 +1269,12 @@ async def build_created_event_embed(event_id: str, guild: Optional[discord.Guild
             start_dt = datetime.fromisoformat(start_iso)
             end_dt = datetime.fromisoformat(end_iso) if end_iso else None
             if end_dt and start_dt.date() == end_dt.date():
+                weekday = start_dt.strftime("%A")
+                de_weekday = weekday_names.get(weekday, weekday)
                 date_part = start_dt.strftime("%d.%m.%y")
                 time_part_start = start_dt.strftime("%H:%M")
                 time_part_end = end_dt.strftime("%H:%M")
-                wann_value = f"{date_part} {time_part_start} – {time_part_end} Uhr"
+                wann_value = f"{de_weekday}, {date_part} {time_part_start} – {time_part_end} Uhr"
             else:
                 start_str = start_dt.strftime("%d.%m.%y %H:%M")
                 end_str = end_dt.strftime("%d.%m.%y %H:%M") if end_dt else ""
