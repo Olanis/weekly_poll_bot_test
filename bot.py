@@ -3,7 +3,7 @@
 bot.py — Event creation: Single modal with flexible parsing, creates Bot Event only (no Discord Scheduled Event).
 Embed layout adjusted: no confirmation on idea delete, no icons in event embed, matches back in poll embed.
 Daily summary now shows only new matches since last post.
-Added quarterly poll with day-based availability, improved navigation within one message, fixed view attribute access, added labels for sections, fixed PollView definition, fixed day selection persistence, updated week calculation to Monday-Sunday, removed checkmarks from weekly poll, added weekly summary for quarterly poll, fixed persistent day display in quarterly poll.
+Added quarterly poll with day-based availability, improved navigation within one message, fixed view attribute access, added labels for sections, fixed PollView definition, fixed day selection persistence, updated week calculation to Monday-Sunday, removed checkmarks from weekly poll, added weekly summary for quarterly poll, fixed persistent day display in quarterly poll, fixed event RSVP button state per user.
 
 Replace your running bot.py with this file and restart the bot.
 """
@@ -1330,34 +1330,31 @@ class EventSignupView(discord.ui.View):
         super().__init__(timeout=None)
         self.event_id = event_id
         self.user_id = user_id
-        # Check if user is interested
-        existing = db_execute("SELECT 1 FROM created_event_rsvps WHERE event_id = ? AND user_id = ?", (event_id, user_id), fetch=True) if user_id else []
-        is_interested = bool(existing)
-        if is_interested:
-            btn = discord.ui.Button(label="✅ Interessiert", style=discord.ButtonStyle.success, custom_id=f"rsvp:{event_id}")
-        else:
-            btn = discord.ui.Button(label="🔔 Interessiert", style=discord.ButtonStyle.secondary, custom_id=f"rsvp:{event_id}")
+        # Button is neutral, state shown via ephemeral message
+        btn = discord.ui.Button(label="🔔 Interessiert", style=discord.ButtonStyle.secondary, custom_id=f"rsvp:{event_id}")
         btn.callback = self.toggle_interested
         self.add_item(btn)
 
     async def toggle_interested(self, interaction: discord.Interaction):
-        await interaction.response.defer()  # Defer to avoid "interaction failed"
         uid = interaction.user.id
         try:
             existing = db_execute("SELECT 1 FROM created_event_rsvps WHERE event_id = ? AND user_id = ?", (self.event_id, uid), fetch=True)
             if existing:
                 db_execute("DELETE FROM created_event_rsvps WHERE event_id = ? AND user_id = ?", (self.event_id, uid))
+                is_now_interested = False
             else:
                 db_execute("INSERT OR IGNORE INTO created_event_rsvps(event_id, user_id) VALUES (?, ?)", (self.event_id, uid))
+                is_now_interested = True
         except Exception:
             log.exception("Error toggling RSVP")
-        # Update the view and message (no confirmation message)
+        # Send ephemeral confirmation instead of editing the message
         try:
-            embed = await build_created_event_embed(self.event_id, interaction.guild)
-            new_view = EventSignupView(self.event_id, interaction.user.id)
-            await interaction.message.edit(embed=embed, view=new_view)
+            await interaction.response.send_message(
+                "✅ Du bist jetzt interessiert!" if is_now_interested else "❌ Du bist nicht mehr interessiert!",
+                ephemeral=True
+            )
         except Exception:
-            log.exception("Failed to update event message after RSVP")
+            pass
 
 # -------------------------
 # Reminders, posting, scheduling, commands (unchanged flow)
