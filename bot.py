@@ -3,7 +3,7 @@
 bot.py — Event creation: Single modal with flexible parsing, creates Bot Event only (no Discord Scheduled Event).
 Embed layout adjusted: no confirmation on idea delete, no icons in event embed, matches back in poll embed.
 Daily summary now shows only new matches since last post.
-Added quarterly poll with day-based availability, improved navigation within one message, fixed view attribute access, added labels for sections, fixed PollView definition, fixed day selection persistence, updated week calculation to Monday-Sunday, removed checkmarks from weekly poll, added weekly summary for quarterly poll, fixed persistent day display in quarterly poll, fixed event RSVP button state per user, reduced critical database operations to avoid filters, made location optional in event creation, removed location from event embed if not set, added show matches button, fixed delete button interaction, added date/time prefill for quarterly matches, made matches toggle in embed, added weekday to event embed when start and end date are the same.
+Added quarterly poll with day-based availability, improved navigation within one message, fixed view attribute access, added labels for sections, fixed PollView definition, fixed day selection persistence, updated week calculation to Monday-Sunday, removed checkmarks from weekly poll, added weekly summary for quarterly poll, fixed persistent day display in quarterly poll, fixed event RSVP button state per user, reduced critical database operations to avoid filters, made location optional in event creation, removed location from event embed if not set, added show matches button, fixed delete button interaction, added date/time prefill for quarterly matches, made matches toggle in embed, added weekday to event embed when start and end date are the same, fixed quarterly match date prefill.
 
 Replace your running bot.py with this file and restart the bot.
 """
@@ -992,7 +992,15 @@ class MatchSelect(discord.ui.Select):
             time_str = f"{hour:02d}:00 - {(hour+1)%24:02d}:00"
             modal = CreateEventModal(self.poll_id, prefill_title=option_text, prefill_date=date_str, prefill_time=time_str)
         else:
-            date_str = slot
+            # For quarterly, slot is like "Mo. 01.10.", extract date part
+            parts = slot.split(". ")
+            if len(parts) > 1:
+                datum_str = parts[1]  # e.g. "01.10."
+                year = datetime.now().year
+                full_datum = f"{datum_str}{year}"  # e.g. "01.10.2025"
+                date_str = f"{full_datum} - {full_datum}"
+            else:
+                date_str = slot  # fallback
             time_str = "10:00 - 11:00"
             modal = CreateEventModal(self.poll_id, prefill_title=option_text, prefill_date=date_str, prefill_time=time_str)
         try:
@@ -1164,7 +1172,7 @@ class CreateEventButton(discord.ui.Button):
             view = SelectMatchView(self.poll_id, matches)
             embed = discord.Embed(
                 title="🎯 Event aus Match erstellen",
-                description="Wähle ein bestehendes Match aus, um ein Event vorzubefillen, oder erstelle ein neues.",
+                description="Wähle ein bestehendes Match aus, um ein Event vorzubefüllen, oder erstelle ein neues.",
                 color=discord.Color.blue()
             )
             try:
