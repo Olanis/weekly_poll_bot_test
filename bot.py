@@ -3,7 +3,7 @@
 bot.py — Event creation: Single modal with flexible parsing, creates Bot Event only (no Discord Scheduled Event).
 Embed layout adjusted: no confirmation on idea delete, no icons in event embed, matches back in poll embed.
 Daily summary now shows only new matches since last post.
-Added quarterly poll with day-based availability, improved navigation within one message, fixed view attribute access, added labels for sections, fixed PollView definition, fixed day selection persistence, updated week calculation to Monday-Sunday, removed checkmarks from weekly poll, added weekly summary for quarterly poll, fixed persistent day display in quarterly poll, fixed event RSVP button state per user, reduced critical database operations to avoid filters, made location optional in event creation, removed location from event embed if not set, added show matches button, fixed delete button interaction, added date/time prefill for quarterly matches, made matches toggle in embed, added weekday to event embed when start and end date are the same, fixed quarterly match date prefill.
+Added quarterly poll with day-based availability, improved navigation within one message, fixed view attribute access, added labels for sections, fixed PollView definition, fixed day selection persistence, updated week calculation to Monday-Sunday, removed checkmarks from weekly poll, added weekly summary for quarterly poll, fixed persistent day display in quarterly poll, fixed event RSVP button state per user, reduced critical database operations to avoid filters, made location optional in event creation, removed location from event embed if not set, added show matches button, fixed delete button interaction, added date/time prefill for quarterly matches, made matches toggle in embed, added weekday to event embed when start and end date are the same, fixed quarterly match date prefill, added logo and German text to event reminders.
 
 Replace your running bot.py with this file and restart the bot.
 """
@@ -992,7 +992,6 @@ class MatchSelect(discord.ui.Select):
             time_str = f"{hour:02d}:00 - {(hour+1)%24:02d}:00"
             modal = CreateEventModal(self.poll_id, prefill_title=option_text, prefill_date=date_str, prefill_time=time_str)
         else:
-            # For quarterly, slot is like "Mo. 01.10.", extract date part
             parts = slot.split(". ")
             if len(parts) > 1:
                 datum_str = parts[1]  # e.g. "01.10."
@@ -1366,6 +1365,7 @@ async def _created_event_reminder_coro(event_id: str, channel_id: int, hours_bef
     if not ch:
         log.info("Reminder: channel %s not found for event %s", channel_id, event_id)
         return
+    guild = ch.guild if hasattr(ch, 'guild') else None
     start_iso = None
     try:
         rows = safe_db_query("SELECT posted_channel_id, posted_message_id, start_time FROM created_events WHERE id = ?", (event_id,), fetch=True) or []
@@ -1396,7 +1396,7 @@ async def _created_event_reminder_coro(event_id: str, channel_id: int, hours_bef
             except Exception:
                 log.exception("Failed while handling old created event message during reminder")
     try:
-        embed = await build_created_event_embed(event_id, None)
+        embed = await build_created_event_embed(event_id, guild)
     except Exception:
         log.exception("Failed building created event embed")
         embed = discord.Embed(title="📣 Event", description="Details", color=discord.Color.orange())
@@ -1407,7 +1407,7 @@ async def _created_event_reminder_coro(event_id: str, channel_id: int, hours_bef
             delta = sdt - now_local
             hours_left = int(delta.total_seconds() // 3600)
             new_title = embed.title or "Event"
-            embed.title = f"📣 starts in ~{hours_left}h — {new_title}"
+            embed.title = f"📣 startet in ~{hours_left}h — {new_title}"
         except Exception:
             pass
     view = EventSignupView(event_id)
