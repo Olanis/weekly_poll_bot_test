@@ -1191,7 +1191,7 @@ class CreateEventButton(discord.ui.Button):
             view = SelectMatchView(self.poll_id, matches)
             embed = discord.Embed(
                 title="🎯 Event aus Match erstellen",
-                description="Wähle ein bestehendes Match aus, um ein Event vorzubefüllen, oder erstelle ein neues.",
+                description="Wähle ein bestehendes Match aus, um ein Event vorzubefüllt zu erstellen.",
                 color=discord.Color.blue()
             )
             try:
@@ -1799,9 +1799,19 @@ def schedule_weekly_post():
 
 def schedule_quarterly_post():
     now = datetime.now(ZoneInfo(POST_TIMEZONE))
-    prev_month = (now.month - 2) % 12 + 1
-    year = now.year if now.month > 1 else now.year - 1
-    trigger = CronTrigger(day=1, month=prev_month, year=year, hour=12, minute=0, timezone=ZoneInfo(POST_TIMEZONE))
+    if now.month <= 3:
+        post_month = 3  # März für Q2
+        post_year = now.year
+    elif now.month <= 6:
+        post_month = 6  # Juni für Q3
+        post_year = now.year
+    elif now.month <= 9:
+        post_month = 9  # September für Q4
+        post_year = now.year
+    else:
+        post_month = 12  # Dezember für Q1 nächsten Jahres
+        post_year = now.year
+    trigger = CronTrigger(day=1, month=post_month, year=post_year, hour=12, minute=0, timezone=ZoneInfo(POST_TIMEZONE))
     scheduler.add_job(job_post_quarterly_coro, trigger=trigger, id="quarterly_poll", replace_existing=True)
 
 def schedule_weekly_summary():
@@ -1815,7 +1825,7 @@ def schedule_daily_summary():
     scheduler.add_job(post_daily_summary, trigger=trigger_evening, id="daily_summary_evening", replace_existing=True)
 
 def schedule_expired_events_update():
-    trigger = CronTrigger(day_of_week="*", hour="*", minute=0, timezone=ZoneInfo(POST_TIMEZONE))  # Every hour at :00
+    trigger = CronTrigger(day_of_week="*", hour="*", minute=0, timezone=ZoneInfo(POST_TIMEZONE))  # Jede Stunde bei :00
     scheduler.add_job(update_expired_events, trigger=trigger, id="expired_events_update", replace_existing=True)
 
 async def register_persistent_poll_views_async(batch_delay: float = 0.02):
