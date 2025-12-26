@@ -1295,10 +1295,6 @@ async def build_created_event_embed(event_id: str, guild: Optional[discord.Guild
         try:
             start_dt = datetime.fromisoformat(start_iso)
             end_dt = datetime.fromisoformat(end_iso) if end_iso else None
-            now = datetime.now(start_dt.tzinfo or timezone.utc)
-            is_past = start_dt < now
-            if is_past:
-                embed.add_field(name="⏰ Status", value="**ABGELAUFEN**", inline=False)
             if end_dt and start_dt.date() == end_dt.date():
                 weekday = start_dt.strftime("%A")
                 de_weekday = weekday_names.get(weekday, weekday)
@@ -1451,33 +1447,9 @@ async def _created_event_reminder_coro(event_id: str, channel_id: int, hours_bef
     except Exception:
         log.exception("Failed to send reminder for created event %s", event_id)
 
-async def update_expired_events():
-    """Automatically update event messages that have expired."""
-    try:
-        now = datetime.now(timezone.utc).isoformat()
-        rows = safe_db_query("SELECT id, posted_channel_id, posted_message_id FROM created_events WHERE start_time < ? AND posted_message_id IS NOT NULL", (now,), fetch=True) or []
-        for event_id, ch_id, msg_id in rows:
-            ch = bot.get_channel(ch_id)
-            if not ch:
-                log.warning(f"Channel {ch_id} for expired event {event_id} not found")
-                continue
-            try:
-                msg = await ch.fetch_message(msg_id)
-                embed = await build_created_event_embed(event_id, ch.guild)
-                await msg.edit(embed=embed)
-                log.info(f"Successfully updated expired event message for event {event_id}")
-            except discord.Forbidden:
-                log.error(f"Bot lacks permissions to edit expired event message for event {event_id} - permissions missing")
-            except discord.NotFound:
-                log.warning(f"Expired event message for event {event_id} not found (already deleted?)")
-            except Exception as e:
-                log.exception(f"Failed to update expired event message for event {event_id}: {e}")
-    except Exception:
-        log.exception("Error in update_expired_events job")
-
 async def post_poll_to_channel(channel: discord.abc.Messageable):
     # Delete old poll messages before posting new one
-    async for msg in channel.history(limit=50):
+    async for msg in channel.history(limit=10):
         if msg.author == bot.user and msg.embeds:
             embed = msg.embeds[0]
             if "Worauf hast du diese Woche Lust?" in embed.title or "Quartalsumfrage" in embed.title or "Tages-Update" in embed.title or "Wöchentliches Update" in embed.title:
@@ -1500,7 +1472,7 @@ async def post_poll_to_channel(channel: discord.abc.Messageable):
 
 async def post_quarterly_poll_to_channel(channel: discord.abc.Messageable):
     # Delete old poll messages before posting new one
-    async for msg in channel.history(limit=50):
+    async for msg in channel.history(limit=10):
         if msg.author == bot.user and msg.embeds:
             embed = msg.embeds[0]
             if "Worauf hast du diese Woche Lust?" in embed.title or "Quartalsumfrage" in embed.title or "Tages-Update" in embed.title or "Wöchentliches Update" in embed.title:
@@ -1846,12 +1818,8 @@ def schedule_daily_summary():
     trigger_evening = CronTrigger(day_of_week="*", hour=18, minute=0, timezone=ZoneInfo(POST_TIMEZONE))
     scheduler.add_job(post_daily_summary, trigger=trigger_evening, id="daily_summary_evening", replace_existing=True)
 
-def schedule_expired_events_update():
-    trigger = CronTrigger(day_of_week="*", hour="*", minute=0, timezone=ZoneInfo(POST_TIMEZONE))  # Jede Stunde bei :00
-    scheduler.add_job(update_expired_events, trigger=trigger, id="expired_events_update", replace_existing=True)
-
 async def register_persistent_poll_views_async(batch_delay: float = 0.02):
-    rows = safe_db_query("SELECT id FROM polls", fetch=True) or []
+    rows = safe_db_query("SELECT id FROM polls ORDER BY created_at DESC LIMIT 20", fetch=True) or []
     if not rows:
         return
     await asyncio.sleep(0.5)
@@ -1876,7 +1844,6 @@ async def on_ready():
     schedule_quarterly_post()
     schedule_weekly_summary()
     schedule_daily_summary()
-    schedule_expired_events_update()
     try:
         bot.loop.create_task(register_persistent_poll_views_async(batch_delay=0.02))
         log.info("Scheduled async registration of PollView instances for existing polls.")
