@@ -1476,6 +1476,17 @@ async def update_expired_events():
         log.exception("Error in update_expired_events job")
 
 async def post_poll_to_channel(channel: discord.abc.Messageable):
+    # Delete old poll messages before posting new one
+    async for msg in channel.history(limit=50):
+        if msg.author == bot.user and msg.embeds:
+            embed = msg.embeds[0]
+            if "Worauf hast du diese Woche Lust?" in embed.title or "Quartalsumfrage" in embed.title or "Tages-Update" in embed.title or "Wöchentliches Update" in embed.title:
+                try:
+                    await msg.delete()
+                    log.info(f"Deleted old poll/summary message {msg.id}")
+                except Exception:
+                    log.exception(f"Failed to delete old poll/summary message {msg.id}")
+
     poll_id = datetime.now(tz=ZoneInfo(POST_TIMEZONE)).strftime("%Y%m%dT%H%M%S")
     create_poll_record(poll_id)
     embed = generate_poll_embed_from_db(poll_id, channel.guild if isinstance(channel, discord.TextChannel) else None, show_matches_flag=show_matches.get(poll_id, False))
@@ -1488,6 +1499,17 @@ async def post_poll_to_channel(channel: discord.abc.Messageable):
     return poll_id
 
 async def post_quarterly_poll_to_channel(channel: discord.abc.Messageable):
+    # Delete old poll messages before posting new one
+    async for msg in channel.history(limit=50):
+        if msg.author == bot.user and msg.embeds:
+            embed = msg.embeds[0]
+            if "Worauf hast du diese Woche Lust?" in embed.title or "Quartalsumfrage" in embed.title or "Tages-Update" in embed.title or "Wöchentliches Update" in embed.title:
+                try:
+                    await msg.delete()
+                    log.info(f"Deleted old poll/summary message {msg.id}")
+                except Exception:
+                    log.exception(f"Failed to delete old poll/summary message {msg.id}")
+
     poll_id = datetime.now(tz=ZoneInfo(POST_TIMEZONE)).strftime("%Y%m%dT%H%M%S") + "_quarterly"
     create_poll_record(poll_id)
     embed = generate_quarterly_poll_embed_from_db(poll_id, channel.guild if isinstance(channel, discord.TextChannel) else None, show_matches_flag=show_matches.get(poll_id, False))
