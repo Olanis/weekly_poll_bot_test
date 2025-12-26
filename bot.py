@@ -1491,7 +1491,7 @@ def get_last_daily_summary(channel_id: int):
 
 def set_last_daily_summary(channel_id: int, message_id: int):
     now = datetime.now(timezone.utc).isoformat()
-    safe_db_query("INSERT OR REPLACE INTO daily_summaries(channel_id, message_id, created_at) VALUES (?, ?, ?)"),
+    safe_db_query("INSERT OR REPLACE INTO daily_summaries(channel_id, message_id, created_at) VALUES (?, ?, ?)",
                (channel_id, message_id, now))
 
 def get_last_weekly_summary(channel_id: int):
@@ -1500,7 +1500,7 @@ def get_last_weekly_summary(channel_id: int):
 
 def set_last_weekly_summary(channel_id: int, message_id: int):
     now = datetime.now(timezone.utc).isoformat()
-    safe_db_query("INSERT OR REPLACE INTO weekly_summaries(channel_id, message_id, created_at) VALUES (?, ?, ?)"),
+    safe_db_query("INSERT OR REPLACE INTO weekly_summaries(channel_id, message_id, created_at) VALUES (?, ?, ?)",
                (channel_id, message_id, now))
 
 async def post_daily_summary():
@@ -1743,9 +1743,13 @@ async def job_post_quarterly_coro():
         log.exception("Failed posting quarterly poll job")
 
 def schedule_weekly_post():
-    # TEMPORÄR GEÄNDERT FÜR TEST: In 2 Minuten statt jeden Sonntag 12:00
+    # TEMPORÄR GEÄNDERT FÜR TEST: Um 23:10 statt jeden Sonntag 12:00
     # Original: trigger = CronTrigger(day_of_week="sun", hour=12, minute=0, timezone=ZoneInfo(POST_TIMEZONE))
-    trigger = DateTrigger(run_date=datetime.now(ZoneInfo(POST_TIMEZONE)) + timedelta(minutes=2))
+    now = datetime.now(ZoneInfo(POST_TIMEZONE))
+    run_date = now.replace(hour=23, minute=13, second=0, microsecond=0)
+    if run_date <= now:
+        run_date += timedelta(days=1)  # Wenn 23:10 schon vorbei, morgen
+    trigger = DateTrigger(run_date=run_date)
     scheduler.add_job(job_post_weekly, trigger=trigger, id="weekly_poll", replace_existing=True)
 
 def schedule_quarterly_post():
