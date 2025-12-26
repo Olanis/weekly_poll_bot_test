@@ -369,6 +369,26 @@ def compute_matches_for_poll_from_db(poll_id: str):
         if common_slots:
             max_count = max(len(info["users"]) for info in common_slots)
             best = [info for info in common_slots if len(info["users"]) == max_count]
+            # Sort best by slot chronologically
+            def sort_key(info):
+                slot = info["slot"]
+                if "-" in slot:
+                    day, hour_s = slot.split("-")
+                    day_idx = _WEEKDAY_MAP.get(day[:2], 7)
+                    hour = int(hour_s)
+                    return (day_idx, hour)
+                else:
+                    # For quarterly, assume date format like "Mo. 01.01."
+                    try:
+                        parts = slot.split(". ")
+                        if len(parts) > 1:
+                            date_str = parts[1]
+                            d = parse_date_ddmmyyyy(date_str)
+                            return (d.weekday(), 0) if d else (7, 0)
+                    except:
+                        pass
+                    return (7, 0)
+            best.sort(key=sort_key)
             results[opt_text] = best
     return results
 
@@ -1275,6 +1295,10 @@ async def build_created_event_embed(event_id: str, guild: Optional[discord.Guild
         try:
             start_dt = datetime.fromisoformat(start_iso)
             end_dt = datetime.fromisoformat(end_iso) if end_iso else None
+            now = datetime.now(start_dt.tzinfo or timezone.utc)
+            is_past = start_dt < now
+            if is_past:
+                embed.add_field(name="⏰ Status", value="**ABGELAUFEN**", inline=False)
             if end_dt and start_dt.date() == end_dt.date():
                 weekday = start_dt.strftime("%A")
                 de_weekday = weekday_names.get(weekday, weekday)
@@ -1743,13 +1767,7 @@ async def job_post_quarterly_coro():
         log.exception("Failed posting quarterly poll job")
 
 def schedule_weekly_post():
-    # TEMPORÄR GEÄNDERT FÜR TEST: Um 23:10 statt jeden Sonntag 12:00
-    # Original: trigger = CronTrigger(day_of_week="sun", hour=12, minute=0, timezone=ZoneInfo(POST_TIMEZONE))
-    now = datetime.now(ZoneInfo(POST_TIMEZONE))
-    run_date = now.replace(hour=23, minute=20, second=0, microsecond=0)
-    if run_date <= now:
-        run_date += timedelta(days=1)  # Wenn 23:10 schon vorbei, morgen
-    trigger = DateTrigger(run_date=run_date)
+    trigger = CronTrigger(day_of_week="sun", hour=12, minute=0, timezone=ZoneInfo(POST_TIMEZONE))
     scheduler.add_job(job_post_weekly_coro, trigger=trigger, id="weekly_poll", replace_existing=True)
 
 def schedule_quarterly_post():
