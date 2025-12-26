@@ -1746,18 +1746,18 @@ def schedule_weekly_post():
     # TEMPORÄR GEÄNDERT FÜR TEST: Um 23:10 statt jeden Sonntag 12:00
     # Original: trigger = CronTrigger(day_of_week="sun", hour=12, minute=0, timezone=ZoneInfo(POST_TIMEZONE))
     now = datetime.now(ZoneInfo(POST_TIMEZONE))
-    run_date = now.replace(hour=23, minute=13, second=0, microsecond=0)
+    run_date = now.replace(hour=23, minute=20, second=0, microsecond=0)
     if run_date <= now:
         run_date += timedelta(days=1)  # Wenn 23:10 schon vorbei, morgen
     trigger = DateTrigger(run_date=run_date)
-    scheduler.add_job(job_post_weekly, trigger=trigger, id="weekly_poll", replace_existing=True)
+    scheduler.add_job(job_post_weekly_coro, trigger=trigger, id="weekly_poll", replace_existing=True)
 
 def schedule_quarterly_post():
     now = datetime.now(ZoneInfo(POST_TIMEZONE))
     prev_month = (now.month - 2) % 12 + 1
     year = now.year if now.month > 1 else now.year - 1
     trigger = CronTrigger(day=1, month=prev_month, year=year, hour=12, minute=0, timezone=ZoneInfo(POST_TIMEZONE))
-    scheduler.add_job(job_post_quarterly, trigger=trigger, id="quarterly_poll", replace_existing=True)
+    scheduler.add_job(job_post_quarterly_coro, trigger=trigger, id="quarterly_poll", replace_existing=True)
 
 def schedule_weekly_summary():
     trigger = CronTrigger(day_of_week="mon", hour=9, minute=0, timezone=ZoneInfo(POST_TIMEZONE))
