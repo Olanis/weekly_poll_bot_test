@@ -3,7 +3,7 @@
 bot.py — Event creation: Single modal with flexible parsing, creates Bot Event only (no Discord Scheduled Event).
 Embed layout adjusted: no confirmation on idea delete, no icons in event embed, matches back in poll embed.
 Daily summary now shows only new matches since last post.
-Added quarterly poll with day-based availability, improved navigation within one message, fixed view attribute access, added labels for sections, fixed PollView definition, fixed day selection persistence, updated week calculation to Monday-Sunday, removed checkmarks from weekly poll, added weekly summary for quarterly poll, fixed persistent day display in quarterly poll, fixed event RSVP button state per user, reduced critical database operations to avoid filters, made location optional in event creation, removed location from event embed if not set, added show matches button, fixed delete button interaction, added date/time prefill for quarterly matches, made matches toggle in embed, added weekday to event embed when start and end date are the same, fixed quarterly match date prefill, added logo and German text to event reminders.
+Added quarterly poll with day-based availability, improved navigation within one message, fixed view attribute access, added labels for sections, fixed PollView definition, fixed day selection persist[...]
 
 Replace your running bot.py with this file and restart the bot.
 """
@@ -1491,7 +1491,7 @@ def get_last_daily_summary(channel_id: int):
 
 def set_last_daily_summary(channel_id: int, message_id: int):
     now = datetime.now(timezone.utc).isoformat()
-    safe_db_query("INSERT OR REPLACE INTO daily_summaries(channel_id, message_id, created_at) VALUES (?, ?, ?)",
+    safe_db_query("INSERT OR REPLACE INTO daily_summaries(channel_id, message_id, created_at) VALUES (?, ?, ?)"),
                (channel_id, message_id, now))
 
 def get_last_weekly_summary(channel_id: int):
@@ -1500,7 +1500,7 @@ def get_last_weekly_summary(channel_id: int):
 
 def set_last_weekly_summary(channel_id: int, message_id: int):
     now = datetime.now(timezone.utc).isoformat()
-    safe_db_query("INSERT OR REPLACE INTO weekly_summaries(channel_id, message_id, created_at) VALUES (?, ?, ?)",
+    safe_db_query("INSERT OR REPLACE INTO weekly_summaries(channel_id, message_id, created_at) VALUES (?, ?, ?)"),
                (channel_id, message_id, now))
 
 async def post_daily_summary():
@@ -1743,7 +1743,9 @@ async def job_post_quarterly_coro():
         log.exception("Failed posting quarterly poll job")
 
 def schedule_weekly_post():
-    trigger = CronTrigger(day_of_week="sun", hour=12, minute=0, timezone=ZoneInfo(POST_TIMEZONE))
+    # TEMPORÄR GEÄNDERT FÜR TEST: In 2 Minuten statt jeden Sonntag 12:00
+    # Original: trigger = CronTrigger(day_of_week="sun", hour=12, minute=0, timezone=ZoneInfo(POST_TIMEZONE))
+    trigger = DateTrigger(run_date=datetime.now(ZoneInfo(POST_TIMEZONE)) + timedelta(minutes=2))
     scheduler.add_job(job_post_weekly, trigger=trigger, id="weekly_poll", replace_existing=True)
 
 def schedule_quarterly_post():
