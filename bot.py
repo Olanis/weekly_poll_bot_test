@@ -1347,8 +1347,11 @@ class EventSignupView(discord.ui.View):
         try:
             embed = await build_created_event_embed(self.event_id, interaction.guild)
             await interaction.message.edit(embed=embed)
-        except Exception:
-            log.exception("Failed to update event message after RSVP")
+            log.info(f"Successfully edited event message for event {self.event_id} - bot has permissions to edit message")
+        except discord.Forbidden:
+            log.error(f"Bot lacks permissions to edit event message for event {self.event_id} - permissions missing")
+        except Exception as e:
+            log.exception(f"Failed to edit event message for event {self.event_id}: {e}")
 
 scheduler = AsyncIOScheduler(timezone=ZoneInfo(POST_TIMEZONE))
 
@@ -1447,6 +1450,30 @@ async def _created_event_reminder_coro(event_id: str, channel_id: int, hours_bef
             log.exception("Failed to persist created event posted ids during reminder")
     except Exception:
         log.exception("Failed to send reminder for created event %s", event_id)
+
+async def update_expired_events():
+    """Automatically update event messages that have expired."""
+    try:
+        now = datetime.now(timezone.utc).isoformat()
+        rows = safe_db_query("SELECT id, posted_channel_id, posted_message_id FROM created_events WHERE start_time < ? AND posted_message_id IS NOT NULL", (now,), fetch=True) or []
+        for event_id, ch_id, msg_id in rows:
+            ch = bot.get_channel(ch_id)
+            if not ch:
+                log.warning(f"Channel {ch_id} for expired event {event_id} not found")
+                continue
+            try:
+                msg = await ch.fetch_message(msg_id)
+                embed = await build_created_event_embed(event_id, ch.guild)
+                await msg.edit(embed=embed)
+                log.info(f"Successfully updated expired event message for event {event_id}")
+            except discord.Forbidden:
+                log.error(f"Bot lacks permissions to edit expired event message for event {event_id} - permissions missing")
+            except discord.NotFound:
+                log.warning(f"Expired event message for event {event_id} not found (already deleted?)")
+            except Exception as e:
+                log.exception(f"Failed to update expired event message for event {event_id}: {e}")
+    except Exception:
+        log.exception("Error in update_expired_events job")
 
 async def post_poll_to_channel(channel: discord.abc.Messageable):
     poll_id = datetime.now(tz=ZoneInfo(POST_TIMEZONE)).strftime("%Y%m%dT%H%M%S")
@@ -1787,6 +1814,10 @@ def schedule_daily_summary():
     trigger_evening = CronTrigger(day_of_week="*", hour=18, minute=0, timezone=ZoneInfo(POST_TIMEZONE))
     scheduler.add_job(post_daily_summary, trigger=trigger_evening, id="daily_summary_evening", replace_existing=True)
 
+def schedule_expired_events_update():
+    trigger = CronTrigger(day_of_week="*", hour="*", minute=0, timezone=ZoneInfo(POST_TIMEZONE))  # Every hour at :00
+    scheduler.add_job(update_expired_events, trigger=trigger, id="expired_events_update", replace_existing=True)
+
 async def register_persistent_poll_views_async(batch_delay: float = 0.02):
     rows = safe_db_query("SELECT id FROM polls", fetch=True) or []
     if not rows:
@@ -1813,6 +1844,7 @@ async def on_ready():
     schedule_quarterly_post()
     schedule_weekly_summary()
     schedule_daily_summary()
+    schedule_expired_events_update()
     try:
         bot.loop.create_task(register_persistent_poll_views_async(batch_delay=0.02))
         log.info("Scheduled async registration of PollView instances for existing polls.")
