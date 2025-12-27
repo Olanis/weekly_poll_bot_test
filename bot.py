@@ -531,7 +531,7 @@ create_event_temp_storage: Dict[str, Dict] = {}
 show_matches: Dict[str, bool] = {}
 
 class SuggestModal(discord.ui.Modal, title="Neue Idee hinzufügen"):
-    idea = discord.ui.TextInput(label="Deine Idee", placeholder="z. B. Minecraft zocken", max_length=100)
+    idea = discord.ui.TextInput(label="Neue Idee", placeholder="z. B. Minecraft zocken", max_length=100)
     def __init__(self, poll_id: str):
         super().__init__(title="Neue Idee hinzufügen")
         self.poll_id = poll_id
@@ -757,9 +757,6 @@ class DayAvailButton(discord.ui.Button):
         uid = interaction.user.id
         _tmp = temp_selections.setdefault(self.poll_id, {})
         user_tmp = _tmp.setdefault(uid, set())
-        persisted = safe_db_query("SELECT slot FROM availability WHERE poll_id = ? AND user_id = ?", (self.poll_id, uid), fetch=True)
-        persisted_set = set(r[0] for r in persisted) if persisted else set()
-        user_tmp.update(persisted_set)
         if self.day in user_tmp:
             user_tmp.remove(self.day)
         else:
