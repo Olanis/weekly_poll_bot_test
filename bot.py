@@ -259,6 +259,15 @@ def get_current_quarter_start() -> date:
         start_month = 10
     return date(year, start_month, 1)
 
+def get_next_quarter_start(current_quarter_start: date) -> date:
+    next_month = ((current_quarter_start.month - 1) // 3 + 1) * 3 + 1
+    if next_month > 12:
+        next_month = 1
+        year = current_quarter_start.year + 1
+    else:
+        year = current_quarter_start.year
+    return date(year, next_month, 1)
+
 def get_quarter_months(start_date: date) -> List[str]:
     months = []
     for i in range(3):
@@ -467,13 +476,15 @@ def generate_poll_embed_from_db(poll_id: str, guild: Optional[discord.Guild] = N
             embed.add_field(name="🤝 Beste Matches", value="Keine gemeinsamen Zeiten gefunden.", inline=False)
     return embed
 
-def generate_quarterly_poll_embed_from_db(poll_id: str, guild: Optional[discord.Guild] = None, show_matches_flag: bool = False):
+def generate_quarterly_poll_embed_from_db(poll_id: str, guild: Optional[discord.Guild] = None, show_matches_flag: bool = False, use_next_quarter: bool = False):
     options = get_options(poll_id)
     votes = get_votes_for_poll(poll_id)
     votes_map = {}
     for opt_id, uid in votes:
         votes_map.setdefault(opt_id, []).append(uid)
     quarter_start = get_current_quarter_start()
+    if use_next_quarter:
+        quarter_start = get_next_quarter_start(quarter_start)
     embed = discord.Embed(
         title=f"📋 Quartalsumfrage Q{(quarter_start.month-1)//3 + 1} {quarter_start.year}",
         description="Gib eigene Ideen ein, stimme ab oder trage deine verfügbaren Tage ein!"
@@ -1482,9 +1493,11 @@ async def post_quarterly_poll_to_channel(channel: discord.abc.Messageable):
                 except Exception:
                     log.exception(f"Failed to delete old poll/summary message {msg.id}")
 
+    now = datetime.now(ZoneInfo(POST_TIMEZONE))
+    is_pre_quarter_month = now.month in [3, 6, 9, 12]
     poll_id = datetime.now(tz=ZoneInfo(POST_TIMEZONE)).strftime("%Y%m%dT%H%M%S") + "_quarterly"
     create_poll_record(poll_id)
-    embed = generate_quarterly_poll_embed_from_db(poll_id, channel.guild if isinstance(channel, discord.TextChannel) else None, show_matches_flag=show_matches.get(poll_id, False))
+    embed = generate_quarterly_poll_embed_from_db(poll_id, channel.guild if isinstance(channel, discord.TextChannel) else None, show_matches_flag=show_matches.get(poll_id, False), use_next_quarter=is_pre_quarter_month)
     view = QuarterlyPollView(poll_id)
     try:
         bot.add_view(view)
