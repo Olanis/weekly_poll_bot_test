@@ -602,6 +602,9 @@ class HourButton(discord.ui.Button):
         uid = interaction.user.id
         _tmp = temp_selections.setdefault(self.poll_id, {})
         user_tmp = _tmp.setdefault(uid, set())
+        if not user_tmp:
+            persisted = safe_db_query("SELECT slot FROM availability WHERE poll_id = ? AND user_id = ?", (self.poll_id, uid), fetch=True)
+            user_tmp.update(r[0] for r in persisted if r)
         if self.slot in user_tmp:
             user_tmp.remove(self.slot)
         else:
@@ -729,6 +732,9 @@ class WeekSelectButton(discord.ui.Button):
         new_view = QuarterlyAvailabilityView(self.poll_id, selected_month=selected_month, months=months, weeks=weeks, selected_week=self.week_index, days=days)
         uid = interaction.user.id
         user_tmp = temp_selections.get(self.poll_id, {}).get(uid, set())
+        if not user_tmp:
+            persisted = safe_db_query("SELECT slot FROM availability WHERE poll_id = ? AND user_id = ?", (self.poll_id, uid), fetch=True)
+            user_tmp.update(r[0] for r in persisted if r)
         for item in new_view.children:
             if isinstance(item, DayAvailButton):
                 if item.day in user_tmp:
@@ -754,6 +760,9 @@ class DayAvailButton(discord.ui.Button):
         uid = interaction.user.id
         _tmp = temp_selections.setdefault(self.poll_id, {})
         user_tmp = _tmp.setdefault(uid, set())
+        if not user_tmp:
+            persisted = safe_db_query("SELECT slot FROM availability WHERE poll_id = ? AND user_id = ?", (self.poll_id, uid), fetch=True)
+            user_tmp.update(r[0] for r in persisted if r)
         if self.day in user_tmp:
             user_tmp.remove(self.day)
         else:
