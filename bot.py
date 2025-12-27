@@ -1458,17 +1458,18 @@ async def _created_event_reminder_coro(event_id: str, channel_id: int, hours_bef
     except Exception:
         log.exception("Failed to send reminder for created event %s", event_id)
 
-async def post_poll_to_channel(channel: discord.abc.Messageable):
-    # Delete old poll messages before posting new one
-    async for msg in channel.history(limit=10):
-        if msg.author == bot.user and msg.embeds:
-            embed = msg.embeds[0]
-            if "Worauf hast du diese Woche Lust?" in embed.title or "Quartalsumfrage" in embed.title or "Tages-Update" in embed.title or "Wöchentliches Update" in embed.title:
-                try:
-                    await msg.delete()
-                    log.info(f"Deleted old poll/summary message {msg.id}")
-                except Exception:
-                    log.exception(f"Failed to delete old poll/summary message {msg.id}")
+async def post_poll_to_channel(channel: discord.abc.Messageable, delete_old: bool = True):
+    if delete_old:
+        # Delete old poll messages before posting new one
+        async for msg in channel.history(limit=10):
+            if msg.author == bot.user and msg.embeds:
+                embed = msg.embeds[0]
+                if "Worauf hast du diese Woche Lust?" in embed.title or "Quartalsumfrage" in embed.title or "Tages-Update" in embed.title or "Wöchentliches Update" in embed.title:
+                    try:
+                        await msg.delete()
+                        log.info(f"Deleted old poll/summary message {msg.id}")
+                    except Exception:
+                        log.exception(f"Failed to delete old poll/summary message {msg.id}")
 
     poll_id = datetime.now(tz=ZoneInfo(POST_TIMEZONE)).strftime("%Y%m%dT%H%M%S")
     create_poll_record(poll_id)
@@ -1481,17 +1482,18 @@ async def post_poll_to_channel(channel: discord.abc.Messageable):
     await channel.send(embed=embed, view=view)
     return poll_id
 
-async def post_quarterly_poll_to_channel(channel: discord.abc.Messageable):
-    # Delete old poll messages before posting new one
-    async for msg in channel.history(limit=10):
-        if msg.author == bot.user and msg.embeds:
-            embed = msg.embeds[0]
-            if "Worauf hast du diese Woche Lust?" in embed.title or "Quartalsumfrage" in embed.title or "Tages-Update" in embed.title or "Wöchentliches Update" in embed.title:
-                try:
-                    await msg.delete()
-                    log.info(f"Deleted old poll/summary message {msg.id}")
-                except Exception:
-                    log.exception(f"Failed to delete old poll/summary message {msg.id}")
+async def post_quarterly_poll_to_channel(channel: discord.abc.Messageable, delete_old: bool = True):
+    if delete_old:
+        # Delete old poll messages before posting new one
+        async for msg in channel.history(limit=10):
+            if msg.author == bot.user and msg.embeds:
+                embed = msg.embeds[0]
+                if "Worauf hast du diese Woche Lust?" in embed.title or "Quartalsumfrage" in embed.title or "Tages-Update" in embed.title or "Wöchentliches Update" in embed.title:
+                    try:
+                        await msg.delete()
+                        log.info(f"Deleted old poll/summary message {msg.id}")
+                    except Exception:
+                        log.exception(f"Failed to delete old poll/summary message {msg.id}")
 
     now = datetime.now(ZoneInfo(POST_TIMEZONE))
     is_pre_quarter_month = now.month in [3, 6, 9, 12]
@@ -1509,7 +1511,7 @@ async def post_quarterly_poll_to_channel(channel: discord.abc.Messageable):
 @bot.command()
 async def startpoll(ctx):
     try:
-        poll_id = await post_poll_to_channel(ctx.channel)
+        poll_id = await post_poll_to_channel(ctx.channel, delete_old=False)
     except Exception as e:
         log.exception("startpoll failed")
         await ctx.send(f"Fehler beim Erstellen der Umfrage: {e}")
@@ -1517,7 +1519,7 @@ async def startpoll(ctx):
 @bot.command()
 async def startquarterlypoll(ctx):
     try:
-        poll_id = await post_quarterly_poll_to_channel(ctx.channel)
+        poll_id = await post_quarterly_poll_to_channel(ctx.channel, delete_old=False)
     except Exception as e:
         log.exception("startquarterlypoll failed")
         await ctx.send(f"Fehler beim Erstellen der Quartalsumfrage: {e}")
