@@ -1275,13 +1275,13 @@ class QuarterlyAddAvailabilityButton(discord.ui.Button):
         super().__init__(label="🗓️ Verfügbarkeit hinzufügen", style=discord.ButtonStyle.success, custom_id=f"qavail:{poll_id}")
         self.poll_id = poll_id
     async def callback(self, interaction: discord.Interaction):
-        uid = interaction.user.id
-        pst = temp_selections.setdefault(self.poll_id, {})
-        if uid not in pst:
-            persisted = safe_db_query("SELECT slot FROM availability WHERE poll_id = ? AND user_id = ?", (self.poll_id, uid), fetch=True)
-            pst[uid] = set(r[0] for r in persisted) if persisted else set()
+        now = datetime.now(ZoneInfo(POST_TIMEZONE))
+        quarter_start = get_current_quarter_start()
+        if now.month in [3, 6, 9, 12]:
+            quarter_start = get_next_quarter_start(quarter_start)
+        months = get_quarter_months(quarter_start)
         try:
-            view = QuarterlyAvailabilityView(self.poll_id)
+            view = QuarterlyAvailabilityView(self.poll_id, months=months)
             embed = discord.Embed(
                 title="🗓️ Quartals-Verfügbarkeit auswählen",
                 description="Wähle Monate des Quartals aus.",
