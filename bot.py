@@ -194,7 +194,15 @@ def parse_date_ddmmyyyy(s: str) -> Optional[date]:
     try:
         parts = s.split(".")
         if len(parts) == 3:
-            d, m, y = map(int, parts)
+            d_str, m_str, y_str = parts
+            d = int(d_str)
+            m = int(m_str)
+            if y_str == "":
+                y = datetime.now().year
+            else:
+                y = int(y_str)
+                if y < 100:
+                    y += 2000
             return date(y, m, d)
         return date.fromisoformat(s)
     except Exception:
@@ -203,7 +211,14 @@ def parse_date_ddmmyyyy(s: str) -> Optional[date]:
 def parse_time_hhmm(s: str) -> Optional[_time]:
     s = s.strip()
     try:
-        hh, mm = map(int, s.split(":"))
+        parts = s.split(":")
+        if len(parts) == 1:
+            hh = int(parts[0])
+            mm = 0
+        elif len(parts) == 2:
+            hh, mm = map(int, parts)
+        else:
+            return None
         return _time(hh, mm)
     except Exception:
         return None
@@ -215,17 +230,10 @@ def parse_date_range(date_range_str: str) -> Tuple[Optional[date], Optional[date
         single_date_str = parts[0]
         if not single_date_str:
             return None, None
-        if single_date_str.count(".") == 1:
-            current_year = datetime.now().year
-            single_date_str += f".{current_year}"
         start_date = parse_date_ddmmyyyy(single_date_str)
         end_date = start_date
     elif len(parts) == 2:
         start_str, end_str = parts
-        if start_str.count(".") == 1:
-            start_str += f".{datetime.now().year}"
-        if end_str.count(".") == 1:
-            end_str += f".{datetime.now().year}"
         start_date = parse_date_ddmmyyyy(start_str)
         end_date = parse_date_ddmmyyyy(end_str)
     else:
@@ -235,13 +243,13 @@ def parse_date_range(date_range_str: str) -> Tuple[Optional[date], Optional[date
 def parse_time_range(time_range_str: str) -> Tuple[Optional[_time], Optional[_time]]:
     time_range_str = time_range_str.strip()
     parts = [p.strip() for p in time_range_str.split("-")]
-    if len(parts) != 2:
+    if len(parts) == 1:
+        start_str = parts[0]
+        end_str = start_str
+    elif len(parts) == 2:
+        start_str, end_str = parts
+    else:
         return None, None
-    start_str, end_str = parts
-    if start_str.isdigit():
-        start_str += ":00"
-    if end_str.isdigit():
-        end_str += ":00"
     start_time = parse_time_hhmm(start_str)
     end_time = parse_time_hhmm(end_str)
     return start_time, end_time
@@ -1063,7 +1071,7 @@ class SelectMatchView(discord.ui.View):
 class CreateEventModal(discord.ui.Modal, title="Event erstellen"):
     title_field = discord.ui.TextInput(label="Titel", style=discord.TextStyle.short, max_length=100)
     description_field = discord.ui.TextInput(label="Beschreibung", style=discord.TextStyle.long, required=False, max_length=2000)
-    date_range_field = discord.ui.TextInput(label="Datumsbereich", style=discord.TextStyle.short, placeholder="01.01.2026 - 02.01.2026", max_length=40)
+    date_range_field = discord.ui.TextInput(label="Datumsbereich", style=discord.TextStyle.short, placeholder="01.01.2026 - 01.08.2026", max_length=40)
     time_range_field = discord.ui.TextInput(label="Zeitbereich", style=discord.TextStyle.short, placeholder="18:00 - 20:00", max_length=20)
     location_field = discord.ui.TextInput(label="Ort", style=discord.TextStyle.short, placeholder="#channelname oder Text", max_length=200, required=False)
 
@@ -1317,9 +1325,7 @@ async def build_created_event_embed(event_id: str, guild: Optional[discord.Guild
                 time_part_end = end_dt.strftime("%H:%M")
                 wann_value = f"{de_weekday}, {date_part} {time_part_start} – {time_part_end} Uhr"
             else:
-                start_str = start_dt.strftime("%d.%m.%y %H:%M")
-                end_str = end_dt.strftime("%d.%m.%y %H:%M") if end_dt else ""
-                wann_value = f"{start_str} – {end_str}" if end_str else start_str
+                wann_value = f"{start_str} – {end_str}"
             embed.add_field(name="Wann", value=wann_value, inline=False)
         except Exception:
             embed.add_field(name="Wann", value=start_iso, inline=False)
