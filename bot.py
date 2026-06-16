@@ -154,6 +154,23 @@ DAYS = ["Mo", "Di", "Mi", "Do", "Fr", "Sa", "So"]
 MONTHS = ["Jan", "Feb", "Mär", "Apr", "Mai", "Jun", "Jul", "Aug", "Sep", "Okt", "Nov", "Dez"]
 HOURS = list(range(12, 24))
 
+def get_quarter_display_name() -> str:
+    """Gibt z.B. 'Juli - September' zurück – genau wie bei der Verfügbarkeit."""
+    now = datetime.now(ZoneInfo(POST_TIMEZONE))
+    quarter_start = get_current_quarter_start()
+    
+    # Im letzten Monat des Quartals → nächstes Quartal
+    if now.month in [3, 6, 9, 12]:
+        quarter_start = get_next_quarter_start(quarter_start)
+    
+    months = get_quarter_months(quarter_start)
+    if not months:
+        return "Quartal"
+    
+    first = months[0].split(".")[0].strip()   # "Jul"
+    last  = months[-1].split(".")[0].strip()  # "Sep"
+    return f"{first} - {last}"
+
 def slot_label_range(day_short: str, hour: int) -> str:
     start = hour % 24
     end = (hour + 1) % 24
@@ -516,7 +533,7 @@ def generate_quarterly_poll_embed_from_db(poll_id: str, guild: Optional[discord.
         quarter_start = get_next_quarter_start(quarter_start)
 
     embed = discord.Embed(
-        title=f"📋 Quartalsumfrage Q{(quarter_start.month-1)//3 + 1} {quarter_start.year}",
+        title=f"📋 Quartalsumfrage {get_quarter_display_name()} {quarter_start.year}",
         description="Gib eigene Ideen ein, stimme ab oder trage deine verfügbaren Tage ein!\n\n",
         color=discord.Color.blurple()
     )
