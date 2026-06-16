@@ -446,8 +446,7 @@ def generate_poll_embed_from_db(poll_id: str, guild: Optional[discord.Guild] = N
 
     embed = discord.Embed(
         title="📋 Worauf hast du diese Woche Lust?",
-        description="Gib eigene Ideen ein, stimme ab oder trage deine Zeiten ein!\n\n"
-                    "**Hinweis:** Bei sehr vielen Ideen werden nur die Top-Ideen angezeigt.",
+        description="Gib eigene Ideen ein, stimme ab oder trage deine Zeiten ein!\n\n",
         color=discord.Color.blurple()
     )
 
@@ -518,8 +517,7 @@ def generate_quarterly_poll_embed_from_db(poll_id: str, guild: Optional[discord.
 
     embed = discord.Embed(
         title=f"📋 Quartalsumfrage Q{(quarter_start.month-1)//3 + 1} {quarter_start.year}",
-        description="Gib eigene Ideen ein, stimme ab oder trage deine verfügbaren Tage ein!\n\n"
-                    "**Hinweis:** Bei sehr vielen Ideen werden nur die Top-Ideen angezeigt.",
+        description="Gib eigene Ideen ein, stimme ab oder trage deine verfügbaren Tage ein!\n\n",
         color=discord.Color.blurple()
     )
 
