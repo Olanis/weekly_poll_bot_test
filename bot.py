@@ -1605,6 +1605,110 @@ async def listpolls(ctx, limit: int = 50):
         await ctx.send(f"Polls:\n{text}")
 
 @bot.command()
+async def exportpoll(ctx, poll_id: str):
+    """Exportiert eine Umfrage als JSON."""
+    options = get_options(poll_id)
+    if not options:
+        await ctx.send("Umfrage nicht gefunden.")
+        return
+
+    data = {
+        "poll_id": poll_id,
+        "exported_at": datetime.now(timezone.utc).isoformat(),
+        "options": [],
+        "votes": [],
+        "availability": []
+    }
+
+    opt_map = {}
+    for opt_id, text, _, author in options:
+        opt_map[opt_id] = text
+        data["options"].append({"id": opt_id, "text": text, "author_id": author})
+
+    for opt_id, user_id in get_votes_for_poll(poll_id):
+        data["votes"].append({"option_text": opt_map.get(opt_id), "user_id": user_id})
+
+    for user_id, slot in get_availability_for_poll(poll_id):
+        data["availability"].append({"user_id": user_id, "slot": slot})
+
+    import json
+    json_str = json.dumps(data, ensure_ascii=False, indent=2)
+    file = discord.File(io.BytesIO(json_str.encode()), filename=f"poll_{poll_id}.json")
+    await ctx.send(f"Export von Umfrage `{poll_id}`:", file=file)
+
+@bot.command()
+async def importpoll(ctx):
+    """Importiert eine Umfrage aus einer JSON-Datei (z.B. von !exportpoll)."""
+    if not ctx.message.attachments:
+        await ctx.send("❌ Bitte häng die JSON-Datei an die Nachricht an.\n"
+                      "Beispiel: `!importpoll` + angehängte Datei `poll_....json`")
+        return
+
+    attachment = ctx.message.attachments[0]
+    if not attachment.filename.endswith(".json"):
+        await ctx.send("❌ Die Datei muss eine `.json`-Datei sein.")
+        return
+
+    try:
+        file_bytes = await attachment.read()
+        import json
+        data = json.loads(file_bytes.decode("utf-8"))
+    except Exception as e:
+        await ctx.send(f"❌ Konnte die JSON-Datei nicht lesen: {e}")
+        return
+
+    # Neue Poll-ID erzeugen
+    is_quarterly = "_quarterly" in data.get("poll_id", "")
+    new_poll_id = datetime.now(tz=ZoneInfo(POST_TIMEZONE)).strftime("%Y%m%dT%H%M%S") + ("_quarterly" if is_quarterly else "_import")
+
+    create_poll_record(new_poll_id)
+
+    # Optionen importieren
+    option_text_to_id = {}  # Text → neue Option-ID (für Votes)
+    for opt in data.get("options", []):
+        text = opt.get("text", "").strip()
+        author_id = opt.get("author_id")
+        if text:
+            new_id = add_option(new_poll_id, text, author_id)
+            option_text_to_id[text] = new_id
+
+    # Votes importieren
+    for vote in data.get("votes", []):
+        text = vote.get("option_text", "").strip()
+        user_id = vote.get("user_id")
+        if text in option_text_to_id and user_id:
+            add_vote(new_poll_id, option_text_to_id[text], user_id)
+
+    # Verfügbarkeiten importieren
+    user_slots = {}
+    for avail in data.get("availability", []):
+        user_id = avail.get("user_id")
+        slot = avail.get("slot")
+        if user_id and slot:
+            user_slots.setdefault(user_id, set()).add(slot)
+
+    for user_id, slots in user_slots.items():
+        persist_availability(new_poll_id, user_id, list(slots))
+
+    # Erfolgsmeldung + Umfrage posten
+    try:
+        if is_quarterly:
+            embed = generate_quarterly_poll_embed_from_db(new_poll_id, ctx.guild, show_matches_flag=False)
+            view = QuarterlyPollView(new_poll_id)
+            msg = await ctx.send("✅ **Quartalsumfrage erfolgreich importiert!**", embed=embed, view=view)
+        else:
+            embed = generate_poll_embed_from_db(new_poll_id, ctx.guild, show_matches_flag=False)
+            view = PollView(new_poll_id)
+            msg = await ctx.send("✅ **Wöchentliche Umfrage erfolgreich importiert!**", embed=embed, view=view)
+
+        await ctx.send(f"**Neue Poll-ID:** `{new_poll_id}`")
+        log.info(f"Umfrage importiert: {new_poll_id} aus {attachment.filename}")
+
+    except Exception as e:
+        log.exception("Fehler beim Posten der importierten Umfrage")
+        await ctx.send(f"✅ Umfrage wurde importiert (ID: `{new_poll_id}`), aber das Posten ist fehlgeschlagen.")
+
+@bot.command()
 async def rerenderpoll(ctx, poll_id: str = None):
     """Rendert eine bestehende Umfrage neu (wichtig nach View-Änderungen)"""
     if not poll_id:
