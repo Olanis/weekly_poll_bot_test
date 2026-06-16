@@ -443,97 +443,139 @@ def generate_poll_embed_from_db(poll_id: str, guild: Optional[discord.Guild] = N
     votes_map = {}
     for opt_id, uid in votes:
         votes_map.setdefault(opt_id, []).append(uid)
+
     embed = discord.Embed(
         title="📋 Worauf hast du diese Woche Lust?",
-        description="Gib eigene Ideen ein, stimme ab oder trage deine Zeiten ein!"
+        description="Gib eigene Ideen ein, stimme ab oder trage deine Zeiten ein!\n\n"
+                    "**Hinweis:** Bei sehr vielen Ideen werden nur die Top-Ideen angezeigt.",
+        color=discord.Color.blurple()
     )
-    for opt_id, opt_text, _created, author_id in options:
+
+    # === Optionen begrenzen ===
+    MAX_FIELDS = 20  # Puffer für Matches
+    displayed_options = options[:MAX_FIELDS]
+
+    for opt_id, opt_text, _created, author_id in displayed_options:
         voters = votes_map.get(opt_id, [])
         count = len(voters)
-        header = f"🗳️ {count} Stimme" if count == 1 else f"🗳️ {count} Stimmen"
+        header = f"🗳️ {count} Stimme{'n' if count != 1 else ''}"
+        
         if voters:
             names = [user_display_name(guild, uid) for uid in voters]
-            if len(names) > 10:
-                shown = names[:10]
-                remaining = len(names) - 10
-                names_line = ", ".join(shown) + f", und {remaining} weitere..."
-            else:
-                names_line = ", ".join(names)
-            value = header + "\n👥 " + names_line
+            names_line = ", ".join(names[:8]) + (f" +{len(names)-8}" if len(names) > 8 else "")
+            value = f"{header}\n👥 {names_line}"
         else:
-            value = header + "\n👥 Keine Stimmen"
+            value = f"{header}\n👥 Keine Stimmen"
+
         embed.add_field(name=opt_text or "(ohne Titel)", value=value, inline=False)
+
+    if len(options) > MAX_FIELDS:
+        embed.add_field(
+            name="⋯ Weitere Ideen",
+            value=f"Es gibt noch **{len(options) - MAX_FIELDS}** weitere Ideen.",
+            inline=False
+        )
+
+    # === Matches ===
     if show_matches_flag:
         matches = compute_matches_for_poll_from_db(poll_id)
         if matches:
-            for opt_text, infos in matches.items():
+            match_count = 0
+            for opt_text, infos in list(matches.items())[:5]:  # max 5 Matches
+                if match_count >= 5:
+                    break
                 lines = []
-                for info in infos:
+                for info in infos[:3]:  # max 3 Slots pro Idee
                     slot = info["slot"]
-                    if "-" in slot:
-                        day, hour_s = slot.split("-")
-                        hour = int(hour_s)
-                        time_str = slot_label_range(day, hour)
-                    else:
-                        time_str = slot
-                    users = info["users"]
-                    names = [user_display_name(guild, u) for u in users]
+                    time_str = slot_label_range(*slot.split("-")) if "-" in slot else slot
+                    names = [user_display_name(guild, u) for u in info["users"][:6]]
                     lines.append(f"{time_str}: {', '.join(names)}")
-                embed.add_field(name=f"🤝 Beste Matches — {opt_text}", value="\n".join(lines), inline=False)
+                embed.add_field(
+                    name=f"🤝 Beste Matches — {opt_text[:80]}",
+                    value="\n".join(lines) or "—",
+                    inline=False
+                )
+                match_count += 1
+
+            if len(matches) > 5:
+                embed.add_field(name="⋯", value=f"Noch {len(matches)-5} weitere Matches", inline=False)
         else:
             embed.add_field(name="🤝 Beste Matches", value="Keine gemeinsamen Zeiten gefunden.", inline=False)
+
     return embed
 
-def generate_quarterly_poll_embed_from_db(poll_id: str, guild: Optional[discord.Guild] = None, show_matches_flag: bool = False, use_next_quarter: bool = False):
+def generate_quarterly_poll_embed_from_db(poll_id: str, guild: Optional[discord.Guild] = None, 
+                                          show_matches_flag: bool = False, use_next_quarter: bool = False):
     options = get_options(poll_id)
     votes = get_votes_for_poll(poll_id)
     votes_map = {}
     for opt_id, uid in votes:
         votes_map.setdefault(opt_id, []).append(uid)
+
     quarter_start = get_current_quarter_start()
     if use_next_quarter:
         quarter_start = get_next_quarter_start(quarter_start)
+
     embed = discord.Embed(
         title=f"📋 Quartalsumfrage Q{(quarter_start.month-1)//3 + 1} {quarter_start.year}",
-        description="Gib eigene Ideen ein, stimme ab oder trage deine verfügbaren Tage ein!"
+        description="Gib eigene Ideen ein, stimme ab oder trage deine verfügbaren Tage ein!\n\n"
+                    "**Hinweis:** Bei sehr vielen Ideen werden nur die Top-Ideen angezeigt.",
+        color=discord.Color.blurple()
     )
-    for opt_id, opt_text, _created, author_id in options:
+
+    # === Optionen begrenzen ===
+    MAX_FIELDS = 20  # Puffer für Matches
+    displayed_options = options[:MAX_FIELDS]
+
+    for opt_id, opt_text, _created, author_id in displayed_options:
         voters = votes_map.get(opt_id, [])
         count = len(voters)
-        header = f"🗳️ {count} Stimme" if count == 1 else f"🗳️ {count} Stimmen"
+        header = f"🗳️ {count} Stimme{'n' if count != 1 else ''}"
+        
         if voters:
             names = [user_display_name(guild, uid) for uid in voters]
-            if len(names) > 10:
-                shown = names[:10]
-                remaining = len(names) - 10
-                names_line = ", ".join(shown) + f", und {remaining} weitere..."
-            else:
-                names_line = ", ".join(names)
-            value = header + "\n👥 " + names_line
+            names_line = ", ".join(names[:8]) + (f" +{len(names)-8}" if len(names) > 8 else "")
+            value = f"{header}\n👥 {names_line}"
         else:
-            value = header + "\n👥 Keine Stimmen"
+            value = f"{header}\n👥 Keine Stimmen"
+
         embed.add_field(name=opt_text or "(ohne Titel)", value=value, inline=False)
+
+    if len(options) > MAX_FIELDS:
+        embed.add_field(
+            name="⋯ Weitere Ideen",
+            value=f"Es gibt noch **{len(options) - MAX_FIELDS}** weitere Ideen.",
+            inline=False
+        )
+
+    # === Matches ===
     if show_matches_flag:
         matches = compute_matches_for_poll_from_db(poll_id)
         if matches:
-            for opt_text, infos in matches.items():
+            match_count = 0
+            for opt_text, infos in list(matches.items())[:5]:  # max 5 Matches
+                if match_count >= 5:
+                    break
                 lines = []
-                for info in infos:
+                for info in infos[:3]:  # max 3 Slots pro Idee
                     slot = info["slot"]
-                    if "-" in slot:
-                        day, hour_s = slot.split("-")
-                        hour = int(hour_s)
-                        time_str = slot_label_range(day, hour)
-                    else:
-                        time_str = slot
-                    users = info["users"]
-                    names = [user_display_name(guild, u) for u in users]
+                    time_str = slot if "-" not in slot else slot_label_range(*slot.split("-"))
+                    names = [user_display_name(guild, u) for u in info["users"][:6]]
                     lines.append(f"{time_str}: {', '.join(names)}")
-                embed.add_field(name=f"🤝 Beste Matches — {opt_text}", value="\n".join(lines), inline=False)
+                embed.add_field(
+                    name=f"🤝 Beste Matches — {opt_text[:80]}",
+                    value="\n".join(lines) or "—",
+                    inline=False
+                )
+                match_count += 1
+
+            if len(matches) > 5:
+                embed.add_field(name="⋯", value=f"Noch {len(matches)-5} weitere Matches", inline=False)
         else:
             embed.add_field(name="🤝 Beste Matches", value="Keine gemeinsamen Tage gefunden.", inline=False)
-    return embed
 
+    return embed
+                                              
 temp_selections: Dict[str, Dict[int, Set[str]]] = {}
 create_event_temp_storage: Dict[str, Dict] = {}
 show_matches: Dict[str, bool] = {}
@@ -857,34 +899,28 @@ class ShowMatchesButton(discord.ui.Button):
 
 class PollView(discord.ui.View):
     def __init__(self, poll_id: str):
-        super().__init__(timeout=None)
-        self.poll_id = poll_id
-        options = get_options(poll_id)
-        for opt_id, opt_text, _created, author_id in options:
-            try:
+            super().__init__(timeout=None)
+            self.poll_id = poll_id
+    
+            options = get_options(poll_id)
+            MAX_OPTION_BUTTONS = 18  # Puffer für andere Buttons
+    
+            for opt_id, opt_text, *_ in options[:MAX_OPTION_BUTTONS]:
                 self.add_item(PollButton(poll_id, opt_id, opt_text))
-            except Exception:
-                pass
-        try:
+    
+            # Feste Buttons
             self.add_item(AddOptionButton(poll_id))
-        except Exception:
-            pass
-        try:
             self.add_item(AddAvailabilityButton(poll_id))
-        except Exception:
-            pass
-        try:
             self.add_item(CreateEventButton(poll_id))
-        except Exception:
-            pass
-        try:
             self.add_item(ShowMatchesButton(poll_id))
-        except Exception:
-            pass
-        try:
             self.add_item(OpenEditOwnIdeasButton(poll_id))
-        except Exception:
-            pass
+    
+            if len(options) > MAX_OPTION_BUTTONS:
+                self.add_item(discord.ui.Button(
+                    label=f"+{len(options)-MAX_OPTION_BUTTONS} weitere Ideen",
+                    style=discord.ButtonStyle.gray,
+                    disabled=True
+                ))
 
 class PollButton(discord.ui.Button):
     def __init__(self, poll_id: str, option_id: int, option_text: str):
@@ -963,17 +999,30 @@ class EditOwnIdeasView(discord.ui.View):
         super().__init__(timeout=None)
         self.poll_id = poll_id
         self.user_id = user_id
+
         user_opts = get_user_options(poll_id, user_id)
+        
         if not user_opts:
-            info = discord.ui.Button(label="Du hast noch keine eigenen Ideen.", style=discord.ButtonStyle.secondary, disabled=True)
-            self.add_item(info)
-        else:
-            for opt_id, opt_text, created in user_opts:
-                label = opt_text if len(opt_text) <= 80 else opt_text[:77] + "..."
-                display_btn = discord.ui.Button(label=label, style=discord.ButtonStyle.secondary, disabled=True)
-                self.add_item(display_btn)
-                del_btn = DeleteOwnOptionButtonEphemeral(poll_id, opt_id, opt_text, user_id)
-                self.add_item(del_btn)
+            self.add_item(discord.ui.Button(
+                label="Du hast noch keine eigenen Ideen.",
+                style=discord.ButtonStyle.secondary,
+                disabled=True
+            ))
+            return
+
+        for i, (opt_id, opt_text, created) in enumerate(user_opts[:12]):  # max ~12 eigene Ideen
+            label = opt_text[:70] + "..." if len(opt_text) > 70 else opt_text
+            self.add_item(discord.ui.Button(label=label, style=discord.ButtonStyle.secondary, disabled=True))
+            
+            del_btn = DeleteOwnOptionButtonEphemeral(poll_id, opt_id, opt_text, user_id)
+            self.add_item(del_btn)
+
+        if len(user_opts) > 12:
+            self.add_item(discord.ui.Button(
+                label=f"+{len(user_opts)-12} weitere eigene Ideen",
+                style=discord.ButtonStyle.gray,
+                disabled=True
+            ))
 
 class OpenEditOwnIdeasButton(discord.ui.Button):
     def __init__(self, poll_id: str):
@@ -1231,32 +1280,26 @@ class QuarterlyPollView(discord.ui.View):
     def __init__(self, poll_id: str):
         super().__init__(timeout=None)
         self.poll_id = poll_id
+
         options = get_options(poll_id)
-        for opt_id, opt_text, _created, author_id in options:
-            try:
-                self.add_item(QuarterlyPollButton(poll_id, opt_id, opt_text))
-            except Exception:
-                pass
-        try:
-            self.add_item(AddOptionButton(poll_id))
-        except Exception:
-            pass
-        try:
-            self.add_item(QuarterlyAddAvailabilityButton(poll_id))
-        except Exception:
-            pass
-        try:
-            self.add_item(CreateEventButton(poll_id))
-        except Exception:
-            pass
-        try:
-            self.add_item(ShowMatchesButton(poll_id))
-        except Exception:
-            pass
-        try:
-            self.add_item(OpenEditOwnIdeasButton(poll_id))
-        except Exception:
-            pass
+        MAX_OPTION_BUTTONS = 18  # Puffer für andere Buttons
+
+        for opt_id, opt_text, *_ in options[:MAX_OPTION_BUTTONS]:
+            self.add_item(QuarterlyPollButton(poll_id, opt_id, opt_text))
+
+        # Feste Buttons
+        self.add_item(AddOptionButton(poll_id))
+        self.add_item(QuarterlyAddAvailabilityButton(poll_id))
+        self.add_item(CreateEventButton(poll_id))
+        self.add_item(ShowMatchesButton(poll_id))
+        self.add_item(OpenEditOwnIdeasButton(poll_id))
+
+        if len(options) > MAX_OPTION_BUTTONS:
+            self.add_item(discord.ui.Button(
+                label=f"+{len(options)-MAX_OPTION_BUTTONS} weitere Ideen",
+                style=discord.ButtonStyle.gray,
+                disabled=True
+            ))
 
 class QuarterlyPollButton(discord.ui.Button):
     def __init__(self, poll_id: str, option_id: int, option_text: str):
