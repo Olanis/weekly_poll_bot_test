@@ -899,28 +899,30 @@ class ShowMatchesButton(discord.ui.Button):
 
 class PollView(discord.ui.View):
     def __init__(self, poll_id: str):
-            super().__init__(timeout=None)
-            self.poll_id = poll_id
-    
-            options = get_options(poll_id)
-            MAX_OPTION_BUTTONS = 18  # Puffer für andere Buttons
-    
-            for opt_id, opt_text, *_ in options[:MAX_OPTION_BUTTONS]:
+        super().__init__(timeout=None)
+        self.poll_id = poll_id
+
+        options = get_options(poll_id)
+        MAX_BUTTONS = 16
+
+        for opt_id, opt_text, *_ in options[:MAX_BUTTONS]:
+            try:
                 self.add_item(PollButton(poll_id, opt_id, opt_text))
-    
-            # Feste Buttons
-            self.add_item(AddOptionButton(poll_id))
-            self.add_item(AddAvailabilityButton(poll_id))
-            self.add_item(CreateEventButton(poll_id))
-            self.add_item(ShowMatchesButton(poll_id))
-            self.add_item(OpenEditOwnIdeasButton(poll_id))
-    
-            if len(options) > MAX_OPTION_BUTTONS:
-                self.add_item(discord.ui.Button(
-                    label=f"+{len(options)-MAX_OPTION_BUTTONS} weitere Ideen",
-                    style=discord.ButtonStyle.gray,
-                    disabled=True
-                ))
+            except Exception:
+                pass
+
+        self.add_item(AddOptionButton(poll_id))
+        self.add_item(AddAvailabilityButton(poll_id))
+        self.add_item(CreateEventButton(poll_id))
+        self.add_item(ShowMatchesButton(poll_id))
+        self.add_item(OpenEditOwnIdeasButton(poll_id))
+
+        if len(options) > MAX_BUTTONS:
+            self.add_item(discord.ui.Button(
+                label=f"+{len(options)-MAX_BUTTONS} weitere Ideen",
+                style=discord.ButtonStyle.gray,
+                disabled=True
+            ))
 
 class PollButton(discord.ui.Button):
     def __init__(self, poll_id: str, option_id: int, option_text: str):
@@ -1001,7 +1003,7 @@ class EditOwnIdeasView(discord.ui.View):
         self.user_id = user_id
 
         user_opts = get_user_options(poll_id, user_id)
-        
+
         if not user_opts:
             self.add_item(discord.ui.Button(
                 label="Du hast noch keine eigenen Ideen.",
@@ -1010,16 +1012,17 @@ class EditOwnIdeasView(discord.ui.View):
             ))
             return
 
-        for i, (opt_id, opt_text, created) in enumerate(user_opts[:12]):  # max ~12 eigene Ideen
-            label = opt_text[:70] + "..." if len(opt_text) > 70 else opt_text
+        MAX_OWN = 12
+        for opt_id, opt_text, created in user_opts[:MAX_OWN]:
+            label = opt_text[:65] + "..." if len(opt_text) > 65 else opt_text
             self.add_item(discord.ui.Button(label=label, style=discord.ButtonStyle.secondary, disabled=True))
             
             del_btn = DeleteOwnOptionButtonEphemeral(poll_id, opt_id, opt_text, user_id)
             self.add_item(del_btn)
 
-        if len(user_opts) > 12:
+        if len(user_opts) > MAX_OWN:
             self.add_item(discord.ui.Button(
-                label=f"+{len(user_opts)-12} weitere eigene Ideen",
+                label=f"+{len(user_opts)-MAX_OWN} weitere eigene Ideen",
                 style=discord.ButtonStyle.gray,
                 disabled=True
             ))
@@ -1282,10 +1285,14 @@ class QuarterlyPollView(discord.ui.View):
         self.poll_id = poll_id
 
         options = get_options(poll_id)
-        MAX_OPTION_BUTTONS = 18  # Puffer für andere Buttons
+        MAX_BUTTONS = 16   # Sicherheitsabstand zu den 25
 
-        for opt_id, opt_text, *_ in options[:MAX_OPTION_BUTTONS]:
-            self.add_item(QuarterlyPollButton(poll_id, opt_id, opt_text))
+        # Option Buttons
+        for opt_id, opt_text, *_ in options[:MAX_BUTTONS]:
+            try:
+                self.add_item(QuarterlyPollButton(poll_id, opt_id, opt_text))
+            except Exception:
+                pass
 
         # Feste Buttons
         self.add_item(AddOptionButton(poll_id))
@@ -1294,9 +1301,9 @@ class QuarterlyPollView(discord.ui.View):
         self.add_item(ShowMatchesButton(poll_id))
         self.add_item(OpenEditOwnIdeasButton(poll_id))
 
-        if len(options) > MAX_OPTION_BUTTONS:
+        if len(options) > MAX_BUTTONS:
             self.add_item(discord.ui.Button(
-                label=f"+{len(options)-MAX_OPTION_BUTTONS} weitere Ideen",
+                label=f"+{len(options)-MAX_BUTTONS} weitere Ideen",
                 style=discord.ButtonStyle.gray,
                 disabled=True
             ))
@@ -1596,6 +1603,40 @@ async def listpolls(ctx, limit: int = 50):
         await ctx.send(file=discord.File(io.BytesIO(text.encode()), filename="polls.txt"))
     else:
         await ctx.send(f"Polls:\n{text}")
+
+@bot.command()
+async def rerenderpoll(ctx, poll_id: str = None):
+    """Rendert eine bestehende Umfrage neu (wichtig nach View-Änderungen)"""
+    if not poll_id:
+        await ctx.send("Bitte eine Poll-ID angeben: `!rerenderpoll POLL_ID`")
+        return
+
+    try:
+        if "_quarterly" in poll_id:
+            embed = generate_quarterly_poll_embed_from_db(poll_id, ctx.guild, show_matches_flag=show_matches.get(poll_id, False))
+            view = QuarterlyPollView(poll_id)
+        else:
+            embed = generate_poll_embed_from_db(poll_id, ctx.guild, show_matches_flag=show_matches.get(poll_id, False))
+            view = PollView(poll_id)
+
+        bot.add_view(view)
+
+        # Suche die alte Nachricht und editiere sie
+        found = False
+        async for msg in ctx.channel.history(limit=100):
+            if msg.author == bot.user and msg.embeds:
+                em = msg.embeds[0]
+                if poll_id in str(em.title) or "Quartalsumfrage" in em.title or "Worauf hast du" in em.title:
+                    await msg.edit(embed=embed, view=view)
+                    await ctx.send(f"✅ Poll `{poll_id}` wurde neu gerendert.")
+                    found = True
+                    break
+
+        if not found:
+            await ctx.send("Keine passende Nachricht gefunden. Poste sie manuell neu mit `!startquarterlypoll` oder `!startpoll`.")
+    except Exception as e:
+        await ctx.send(f"Fehler: {e}")
+        log.exception("rerenderpoll failed")
 
 def get_last_daily_summary(channel_id: int):
     rows = safe_db_query("SELECT message_id FROM daily_summaries WHERE channel_id = ?", (channel_id,), fetch=True)
