@@ -5,7 +5,7 @@ Embed layout adjusted: no confirmation on idea delete, no icons in event embed, 
 Daily summary now shows only new matches since last post.
 Added quarterly poll with day-based availability, improved navigation within one message, fixed view attribute access, added labels for sections, fixed PollView definition, fixed day selection persist[...]
 
-Replace your running bot.py with this file and restart the bot.
+Replace your running bot.py with this file and restart the bot. Test
 """
 from __future__ import annotations
 
